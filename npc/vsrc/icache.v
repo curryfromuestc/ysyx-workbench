@@ -109,25 +109,19 @@ module icache #(
     end
   end
 
-  // victim 选择 (规范性): 先扫一遍 invalid way; 若有 invalid 就挑它 (避免无谓
-  // 踢一个合法表项). 没有 invalid 时再退化到 LRU = (age == WAYS-1) 的那一路.
-  // WAYS=1 时 WAYS-1=0, way0 始终 age=0, 永远是 victim. 已通过 W=1 退化等效
-  // B4a 验证 -- 加 invalid-first 后, 因 age 初值排列 (wi=>age=wi) 已经让 cold
-  // start 期间 victim 与 invalid-first 路径一致, 所以实测值不变, 仅是语义增强.
+  // victim 选择: invalid-first (避免踢合法 entry), 全 valid 时退化到 LRU.
   reg [IDX_W-1:0] victim_way;
   reg             has_invalid;
   integer iv;
   always @(*) begin
     victim_way  = {IDX_W{1'b0}};
     has_invalid = 1'b0;
-    // 第一遍: 找最低编号的 invalid way (优先编码).
     for (iv = 0; iv < WAYS; iv = iv + 1) begin
       if (!valid_arr[req_index][iv] & ~has_invalid) begin
         victim_way  = iv[IDX_W-1:0];
         has_invalid = 1'b1;
       end
     end
-    // 第二遍: 全 valid 时退化到 LRU = age==WAYS-1 那一路.
     if (!has_invalid) begin
       for (iv = 0; iv < WAYS; iv = iv + 1) begin
         if (age_arr[req_index][iv] == (WAYS-1)) victim_way = iv[IDX_W-1:0];
@@ -182,13 +176,9 @@ module icache #(
   end
 
   // ---- 主时序: 状态 + 填表 + LRU 更新 -------------------------------------
-  // 触发 LRU 更新的事件:
-  //   idle_hit  -> touched_way = hit_way
-  //   miss_done -> touched_way = victim_way (新填进的路, 视为 MRU)
+  // touched_way = idle_hit ? hit_way : victim_way (miss 填回也算 MRU).
+  // touched_age 提到 wire 以避免在 always 块内重复变量索引同一项.
   wire [IDX_W-1:0] touched_way = idle_hit ? hit_way : victim_way;
-  // 把 touched_way 此刻的 age 提到组合层 (因为 always 内 age_arr[touched_way]
-  // 是个变量索引, Verilator 会展开 mux; 提到 wire 一来可读, 二来 quartus/yosys
-  // 也能识别).
   wire [AGE_W-1:0] touched_age = age_arr[req_index][touched_way];
 
   integer si, wi;
@@ -215,15 +205,7 @@ module icache #(
         data_arr [req_index][victim_way] <= bus_resp_data;
       end
 
-      // LRU 更新: 不管命中还是 miss 填回, 都把 touched_way 设为 MRU (age=0),
-      // 比 touched_way 旧的 (age < touched_age) 不动, 比 touched_way 新的 (age <
-      // touched_age 但因 touched 即将变 0 我们让它们 age+1, 即 "比 touched 更新
-      // 或与 touched 同新" 的都 +1) -> 严格说: 原 age < touched_age 的 +1.
-      // 不变量证明: 原排列 {0,1,..,WAYS-1}, touched 的 age = k. 处理后:
-      //   原 age < k 的 way 都 +1 -> 占据 1..k
-      //   touched way -> 0
-      //   原 age > k 的 way 不变 -> 占据 k+1..WAYS-1
-      //   合起来还是 0..WAYS-1 的排列.
+      // LRU 更新 (规则与不变量证明见文件顶部 docstring).
       if (idle_hit | miss_done) begin
         for (wi = 0; wi < WAYS; wi = wi + 1) begin
           if (wi[IDX_W-1:0] == touched_way) begin
