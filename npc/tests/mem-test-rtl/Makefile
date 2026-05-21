@@ -28,13 +28,22 @@ PSRAM_SRCS := $(PERIP_DIR)/psram/psram_top_apb.v \
               $(PERIP_DIR)/psram/psram.v \
               $(TOPDIR)/tb_psram.v
 
+# B2c: 1 MiB stress variant of the same harness. Re-uses the same RTL --
+# only the testbench top differs (size 4 KiB -> 1 MiB).
+PSRAM_1M_SRCS := $(PERIP_DIR)/psram/psram_top_apb.v \
+                 $(PERIP_DIR)/psram/efabless/EF_PSRAM_CTRL_wb.v \
+                 $(PERIP_DIR)/psram/efabless/EF_PSRAM_CTRL.v \
+                 $(PERIP_DIR)/psram/psram.v \
+                 $(TOPDIR)/tb_psram_1m.v
+
 SDRAM_SRCS := $(PERIP_DIR)/sdram/sdram_top_apb.v \
               $(PERIP_DIR)/sdram/core_sdram_axi4/sdram_axi_core.v \
               $(PERIP_DIR)/sdram/sdram.v \
               $(TOPDIR)/tb_sdram.v
 
-BUILD_PSRAM := $(TOPDIR)/build/psram
-BUILD_SDRAM := $(TOPDIR)/build/sdram
+BUILD_PSRAM    := $(TOPDIR)/build/psram
+BUILD_PSRAM_1M := $(TOPDIR)/build/psram_1m
+BUILD_SDRAM    := $(TOPDIR)/build/sdram
 
 VFLAGS := --binary --timing -j 1 \
           --timescale "1ns/1ps" \
@@ -50,8 +59,10 @@ VFLAGS := --binary --timing -j 1 \
 
 PYTHON3 := $(shell command -v python3.12 || command -v python3.11 || command -v python3 || echo /usr/bin/python3)
 
-.PHONY: all psram sdram clean
+.PHONY: all psram psram-1m sdram clean
 
+# Default leaves the 1 MiB stress test out so `make all` stays fast for the
+# B2b smoke regression. Run it explicitly with `make psram-1m`.
 all: psram sdram
 
 $(BUILD_PSRAM)/Vtb_psram: $(PSRAM_SRCS) $(COMMON_INC)
@@ -68,9 +79,20 @@ $(BUILD_SDRAM)/Vtb_sdram: $(SDRAM_SRCS) $(COMMON_INC)
 	  -MAKEFLAGS "PYTHON3=$(PYTHON3)" \
 	  $(SDRAM_SRCS)
 
+$(BUILD_PSRAM_1M)/Vtb_psram_1m: $(PSRAM_1M_SRCS) $(COMMON_INC)
+	@mkdir -p $(BUILD_PSRAM_1M)
+	verilator $(VFLAGS) --top-module tb_psram_1m \
+	  -Mdir $(BUILD_PSRAM_1M) -o Vtb_psram_1m \
+	  -MAKEFLAGS "PYTHON3=$(PYTHON3)" \
+	  $(PSRAM_1M_SRCS)
+
 psram: $(BUILD_PSRAM)/Vtb_psram
 	@echo "==> running PSRAM mem-test"
 	$(BUILD_PSRAM)/Vtb_psram
+
+psram-1m: $(BUILD_PSRAM_1M)/Vtb_psram_1m
+	@echo "==> running PSRAM mem-test 1MiB stress"
+	$(BUILD_PSRAM_1M)/Vtb_psram_1m
 
 sdram: $(BUILD_SDRAM)/Vtb_sdram
 	@echo "==> running SDRAM mem-test"
