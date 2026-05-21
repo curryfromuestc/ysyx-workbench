@@ -67,6 +67,27 @@ sim: $(BIN) $(DEFAULT_IMG)
 	  echo "==> $(BIN) --image=$(DEFAULT_IMG)"; $(BIN) --image=$(DEFAULT_IMG); \
 	fi
 
+# ---- C3 sim with VCD wave dump (for gtkwave) --------------------------------
+# Same harness as `sim`, but with --trace + -DVCD_TRACE so the main loop
+# emits build/wave.vcd. Default image still cpu-tests.bin; pass FILE= to
+# override the dump path.
+TRACE_BIN  := $(BUILD_DIR)/npc-trace
+TRACE_OBJ  := $(BUILD_DIR)/obj_dir_trace
+WAVE       ?= $(BUILD_DIR)/wave.vcd
+
+$(TRACE_BIN): $(VSRCS) $(CSRCS)
+	@mkdir -p $(BUILD_DIR)
+	verilator $(VFLAGS) --trace -DVCD_TRACE \
+	  -CFLAGS "-O2 -std=c++17 -DVCD_TRACE" \
+	  -Mdir $(TRACE_OBJ) -o $(TRACE_BIN) \
+	  -MAKEFLAGS "PYTHON3=$(PYTHON3)" $(VSRCS) $(CSRCS)
+
+sim-trace: $(TRACE_BIN) $(DEFAULT_IMG)
+	@echo "==> $(TRACE_BIN) --image=$(DEFAULT_IMG) --trace=$(WAVE)"
+	$(TRACE_BIN) --image=$(DEFAULT_IMG) --trace=$(WAVE)
+	@echo "==> wave.vcd written: $(WAVE)"
+	@ls -lh $(WAVE)
+
 # ---- D6 ysyxSoC harness -----------------------------------------------------
 SOC_DIR        := $(TOPDIR)/vsrc-soc
 SOC_OBJ_DIR    := $(BUILD_DIR)/obj_dir_soc
@@ -162,6 +183,6 @@ yosys-synth: $(SYN_RTL_SRCS) $(TOPDIR)/syn/synth_soc_top.ys $(TOPDIR)/syn/synth_
 	@echo "==> yosys synthesis OK: clean lint, all check -assert passed"
 	@echo "    full log: $(SYN_LOG_SOC) and $(SYN_LOG_CPU)"
 
-.PHONY: all sim sim-soc clean yosys-synth
+.PHONY: all sim sim-soc sim-trace clean yosys-synth
 
 include $(TOPDIR)/../Makefile

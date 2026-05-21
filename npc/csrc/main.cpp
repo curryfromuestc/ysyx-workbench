@@ -15,6 +15,9 @@
 #include <verilated.h>
 #include "Vcpu.h"
 #include "Vcpu___024root.h"
+#ifdef VCD_TRACE
+#include <verilated_vcd_c.h>
+#endif
 
 #define PMEM_BASE   0x80000000u
 #define PMEM_SIZE   (128u * 1024u * 1024u)
@@ -214,7 +217,6 @@ static ref_memcpy_fn   ref_memcpy = nullptr;
 static ref_regcpy_fn   ref_regcpy = nullptr;
 static ref_exec_fn     ref_exec   = nullptr;
 static ref_init_fn     ref_init   = nullptr;
-static uint64_t        diff_mismatch_cycle = 0;
 // Latched at clk=0 phase, consumed after clk=1 phase. Records whether the
 // instruction that is ABOUT TO retire touches an MMIO address. We sample
 // pre-edge because right after the posedge the combinational LSU signals
@@ -229,10 +231,22 @@ enum { DIFF_TO_DUT = 0, DIFF_TO_REF = 1 };
 // build/obj_dir/Vcpu___024root.h again.
 static inline uint32_t rtl_pc()                  { return top->rootp->cpu__DOT__pc; }
 static inline uint32_t rtl_gpr(int i)            { return top->rootp->cpu__DOT__u_rf__DOT__rf[i]; }
-static inline uint32_t rtl_lsu_addr()            { return top->rootp->cpu__DOT__u_exu__DOT__alu_result; }
+static inline uint32_t rtl_lsu_addr() {
+#ifdef VCD_TRACE
+  return 0;  // not used in trace mode (difftest disabled)
+#else
+  return top->rootp->cpu__DOT__u_exu__DOT__alu_result;
+#endif
+}
 static inline bool     rtl_lsu_active() {
+#ifdef VCD_TRACE
+  // --trace inlines the cell-input wires away; in trace mode we don't run
+  // difftest, so we can safely return false (no MMIO skip needed).
+  return false;
+#else
   return top->rootp->cpu__DOT____Vcellinp__u_lsu__mem_re
       || top->rootp->cpu__DOT____Vcellinp__u_lsu__mem_we;
+#endif
 }
 
 static void snapshot_dut(NpcRegState *s) {
@@ -244,13 +258,10 @@ static void snapshot_dut(NpcRegState *s) {
   s->mcause  = 0;
 }
 
-// Side-effect-free MMIO predicate. The LSU's raw alu_result is a byte
-// address — strip the low 2 bits so we hit the same word-granular MMIO
-// regions the pmem_read/pmem_write hooks recognise.
+// Difftest's MMIO predicate. Word-aligns first because alu_result is a raw
+// byte address (e.g. 0x10000003 for an LCR store), then reuses in_mmio().
 static inline bool addr_is_mmio(uint32_t a) {
-  uint32_t wa = a & ~3u;
-  return wa == UART_BASE_W0 || wa == UART_BASE_W1
-      || wa == RTC_ADDR_LO  || wa == RTC_ADDR_HI;
+  return in_mmio(a & ~3u);
 }
 
 static void diff_init_so(const char *so) {
@@ -337,9 +348,8 @@ static void diff_step_and_check() {
     }
   }
   if (bad) {
-    diff_mismatch_cycle = cycle_cnt;
     fprintf(stderr, "DIFFTEST: failed (first mismatch at cycle %llu, dut pc=0x%08x)\n",
-            (unsigned long long)diff_mismatch_cycle, dut_pc);
+            (unsigned long long)cycle_cnt, dut_pc);
     // Force loop exit. We reuse trap_hit so the "DIFFTEST: failed" print at
     // the end of main() also lands.
     trap_hit  = true;
@@ -352,15 +362,26 @@ static void diff_step_and_check() {
 // predicate at clk=0 phase (after combinational has settled, before the
 // register update), then trigger the posedge. The caller is responsible for
 // invoking diff_step_and_check() after this returns, unless `rst` is high.
+#ifdef VCD_TRACE
+static VerilatedVcdC *tfp = nullptr;
+static uint64_t       vcd_time = 0;
+#endif
+
 static void clock_pulse() {
   top->clk = 0;
   top->eval();
+#ifdef VCD_TRACE
+  if (tfp) { tfp->dump(vcd_time); vcd_time++; }
+#endif
   if (diff_enabled && !top->rst) {
     uint32_t a = rtl_lsu_addr();
     diff_was_mmio_this_cycle = rtl_lsu_active() && addr_is_mmio(a);
   }
   top->clk = 1;
   top->eval();
+#ifdef VCD_TRACE
+  if (tfp) { tfp->dump(vcd_time); vcd_time++; }
+#endif
   cycle_cnt++;
 }
 
@@ -369,14 +390,23 @@ int main(int argc, char **argv) {
 
   const char *image_path = nullptr;
   const char *diff_so    = nullptr;
+  const char *trace_path = nullptr;
   for (int i = 1; i < argc; ++i) {
     const char *a = argv[i];
     if (!strncmp(a, "--image=", 8))         image_path = a + 8;
     else if (!strncmp(a, "--diff=", 7))     diff_so    = a + 7;
+    else if (!strncmp(a, "--trace=", 8))    trace_path = a + 8;
     else if (!strncmp(a, "--max-cycles=", 13))
       max_cycles = strtoull(a + 13, nullptr, 0);
     else if (a[0] != '-')                   image_path = a;
   }
+  (void)trace_path;
+#ifdef VCD_TRACE
+  if (trace_path) {
+    Verilated::traceEverOn(true);
+    tfp = new VerilatedVcdC;
+  }
+#endif
 
   pmem = (uint8_t *)calloc(PMEM_SIZE, 1);
   if (!pmem) { fprintf(stderr, "npc: pmem alloc failed\n"); return 2; }
@@ -393,14 +423,17 @@ int main(int argc, char **argv) {
   diff_init_so(diff_so);
 
   top = new Vcpu;
+#ifdef VCD_TRACE
+  if (tfp) { top->trace(tfp, 99); tfp->open(trace_path); }
+#endif
 
-  // reset for 5 cycles. We hold diff disabled-ish (clock_pulse() skips its
-  // pre-edge MMIO sample while rst==1), then sync REF to DUT's reset state.
+  // reset for 5 cycles. clock_pulse() skips its MMIO sample while rst==1,
+  // so no spurious skips get latched during these cycles.
   top->rst = 1;
   for (int i = 0; i < 5; ++i) clock_pulse();
   top->rst = 0;
-  // After reset is released we still need one combinational settle to expose
-  // the post-reset register values before we snapshot them for REF.
+  // One combinational settle after dropping rst so the snapshot we hand REF
+  // reflects the post-reset register file (rf[*]=0, pc=PC_RESET_VEC).
   top->eval();
   diff_sync_from_dut(image_size);
 
@@ -414,7 +447,7 @@ int main(int argc, char **argv) {
     if (trap_code == -2) {
       // diff_step_and_check already printed the per-reg diff lines above.
       printf("DIFFTEST: failed (mismatch at cycle %llu)\n",
-             (unsigned long long)diff_mismatch_cycle);
+             (unsigned long long)cycle_cnt);
       rc = 1;
     } else if (trap_code == 0) {
       printf("HIT GOOD TRAP\n");
@@ -430,6 +463,9 @@ int main(int argc, char **argv) {
   }
   fprintf(stderr, "npc: cycles=%llu\n", (unsigned long long)cycle_cnt);
 
+#ifdef VCD_TRACE
+  if (tfp) { tfp->close(); delete tfp; tfp = nullptr; }
+#endif
   delete top;
   if (diff_handle) dlclose(diff_handle);
   free(pmem);
