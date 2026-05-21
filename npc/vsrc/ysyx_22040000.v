@@ -1,14 +1,14 @@
 // =============================================================================
-// ysyx_22040000  --  D6 SoC top wrapper
+// ysyx_22040000  --  D6/C2 SoC top wrapper
 // =============================================================================
-// Multi-cycle minirv CPU that speaks SimpleBus (ysyxSoC `MemBridge` protocol).
+// Multi-cycle RV32E_Zicsr CPU that speaks SimpleBus (ysyxSoC `MemBridge`).
 //
-// Pin names / widths match `ysyxSoC/ready-to-run/D-stage/cpu-interface.md`
-// exactly. The module instantiates the same IDU / EXU / RegFile / CSR / WBU
-// modules used by the DPI harness, but replaces the combinational IFU / LSU
-// with bus state machines so each fetch / load / store waits for `respValid`.
+// Pin names / widths match `ysyxSoC/ready-to-run/D-stage/cpu-interface.md`.
+// The wrapper instantiates the same IDU / EXU / RegFile / CSR / WBU modules
+// used by the DPI harness, but replaces the combinational IFU / LSU with bus
+// state machines so each fetch / load / store waits for `respValid`.
 //
-// State machine summary (single FSM that sequences every instruction):
+// State machine (single FSM that sequences every instruction):
 //   S_IF : drive io_ifu_reqValid=1, wait for io_ifu_respValid, latch instruction.
 //   S_EX : decode/execute combinationally. For non-load/store -> go S_WB
 //          directly. For load/store -> drive io_lsu_reqValid=1, wait for
@@ -16,10 +16,8 @@
 //   S_WB : commit: write regfile (if reg_wen), write CSR (if csr_we), update PC,
 //          then go back to S_IF.
 //
-// The wrapper intentionally uses a single posedge process for FSM updates and
-// only asserts `reg_wen` / `csr_we` for one cycle (in S_WB). This avoids
-// duplicate writes that would otherwise happen because IDU is purely
-// combinational and fires every cycle the instruction is held.
+// reg_wen / csr_we are only asserted for one cycle (in S_WB) to avoid double
+// writes that would otherwise happen because IDU is purely combinational.
 //
 // Reset vector: 0x30000000 (Flash base on the SoC).
 // =============================================================================
@@ -62,13 +60,18 @@ module ysyx_22040000(
   wire [3:0]  rs1_a, rs2_a, rd_a;
   wire [31:0] imm;
   wire        alu_src;
-  wire [1:0]  alu_op;
+  wire [3:0]  alu_op;
+  wire        alu_use_pc;
   wire        mem_re, mem_we;
   wire [2:0]  funct3;
   wire [1:0]  wb_sel;
   wire        reg_wen_dec;
+  wire        is_jal;
   wire        is_jalr;
+  wire        is_branch;
+  wire [2:0]  branch_op;
   wire        is_ebreak;
+  wire        is_mret;
   wire        is_csr;
   wire [11:0] csr_addr;
   wire [4:0]  csr_uimm;
@@ -78,12 +81,14 @@ module ysyx_22040000(
   wire [1:0]  csr_op;
 
   IDU u_idu (
-    .inst(inst),
+    .inst(inst), .pc(pc),
     .rs1(rs1_a), .rs2(rs2_a), .rd(rd_a),
-    .imm(imm), .alu_src(alu_src), .alu_op(alu_op),
+    .imm(imm), .alu_src(alu_src), .alu_op(alu_op), .alu_use_pc(alu_use_pc),
     .mem_re(mem_re), .mem_we(mem_we), .funct3(funct3),
     .wb_sel(wb_sel), .reg_wen(reg_wen_dec),
-    .is_jalr(is_jalr), .is_ebreak(is_ebreak),
+    .is_jal(is_jal), .is_jalr(is_jalr),
+    .is_branch(is_branch), .branch_op(branch_op),
+    .is_ebreak(is_ebreak), .is_mret(is_mret),
     .is_csr(is_csr), .csr_addr(csr_addr),
     .csr_uimm(csr_uimm), .csr_use_uimm(csr_use_uimm),
     .csr_re(csr_re), .csr_we(csr_we_dec), .csr_op(csr_op)
@@ -92,7 +97,6 @@ module ysyx_22040000(
   // ---- Register file --------------------------------------------------------
   wire [31:0] rs1_val, rs2_val;
   wire [31:0] wb_data;
-  // Only commit the register write in S_WB to avoid double-writes.
   wire        reg_wen_wb = reg_wen_dec & (state == S_WB) & ~is_ebreak;
 
   RegFile #(.ADDR_WIDTH(4), .DATA_WIDTH(32)) u_rf (
@@ -104,18 +108,19 @@ module ysyx_22040000(
 
   // ---- EXU ------------------------------------------------------------------
   wire [31:0] alu_result;
+  wire        branch_taken;
   EXU u_exu (
+    .pc(pc),
     .rs1_val(rs1_val), .rs2_val(rs2_val), .imm(imm),
-    .alu_src(alu_src), .alu_op(alu_op),
-    .alu_result(alu_result)
+    .alu_src(alu_src), .alu_use_pc(alu_use_pc), .alu_op(alu_op),
+    .branch_op(branch_op),
+    .alu_result(alu_result), .branch_taken(branch_taken)
   );
 
   // ---- LSU: build aligned store word + wmask --------------------------------
-  // Load data path will choose between bus rdata (latched) and zero-extend.
   reg  [31:0] lsu_rdata_r;
   wire [1:0]  byte_off = alu_result[1:0];
 
-  // Build store word / wmask combinationally.
   reg  [31:0] store_word;
   reg  [3:0]  store_wmask;
   reg  [1:0]  store_size;
@@ -129,6 +134,13 @@ module ysyx_22040000(
           store_word  = rs2_val;
           store_wmask = 4'b1111;
           store_size  = 2'b10;
+        end
+        3'b001: begin                                       // sh
+          case (byte_off[1])
+            1'b0: begin store_word = {16'h0, rs2_val[15:0]};            store_wmask = 4'b0011; end
+            1'b1: begin store_word = {rs2_val[15:0], 16'h0};            store_wmask = 4'b1100; end
+          endcase
+          store_size = 2'b01;
         end
         3'b000: begin                                       // sb
           case (byte_off)
@@ -148,31 +160,43 @@ module ysyx_22040000(
     end
   end
 
-  // Build read size for loads.
   reg [1:0] load_size;
   always @(*) begin
     case (funct3)
+      3'b000: load_size = 2'b00; // lb
+      3'b001: load_size = 2'b01; // lh
       3'b010: load_size = 2'b10; // lw
       3'b100: load_size = 2'b00; // lbu
+      3'b101: load_size = 2'b01; // lhu
       default: load_size = 2'b10;
     endcase
   end
 
   // Decode load result (use latched rdata).
   reg [31:0] load_data;
+  reg [7:0]  ld_byte_sel;
+  reg [15:0] ld_half_sel;
   always @(*) begin
+    case (byte_off)
+      2'b00:   ld_byte_sel = lsu_rdata_r[ 7: 0];
+      2'b01:   ld_byte_sel = lsu_rdata_r[15: 8];
+      2'b10:   ld_byte_sel = lsu_rdata_r[23:16];
+      2'b11:   ld_byte_sel = lsu_rdata_r[31:24];
+      default: ld_byte_sel = 8'h0;
+    endcase
+    case (byte_off[1])
+      1'b0:    ld_half_sel = lsu_rdata_r[15: 0];
+      1'b1:    ld_half_sel = lsu_rdata_r[31:16];
+      default: ld_half_sel = 16'h0;
+    endcase
     load_data = 32'h0;
     if (mem_re) begin
       case (funct3)
-        3'b010: load_data = lsu_rdata_r;
-        3'b100: begin
-          case (byte_off)
-            2'b00: load_data = {24'h0, lsu_rdata_r[ 7: 0]};
-            2'b01: load_data = {24'h0, lsu_rdata_r[15: 8]};
-            2'b10: load_data = {24'h0, lsu_rdata_r[23:16]};
-            2'b11: load_data = {24'h0, lsu_rdata_r[31:24]};
-          endcase
-        end
+        3'b000: load_data = {{24{ld_byte_sel[7]}},  ld_byte_sel};   // lb
+        3'b001: load_data = {{16{ld_half_sel[15]}}, ld_half_sel};   // lh
+        3'b010: load_data = lsu_rdata_r;                            // lw
+        3'b100: load_data = {24'h0, ld_byte_sel};                   // lbu
+        3'b101: load_data = {16'h0, ld_half_sel};                   // lhu
         default: load_data = lsu_rdata_r;
       endcase
     end
@@ -180,6 +204,7 @@ module ysyx_22040000(
 
   // ---- CSR ------------------------------------------------------------------
   wire [31:0] csr_rdata;
+  wire [31:0] mepc_w;
   wire [31:0] csr_src = csr_use_uimm ? {27'b0, csr_uimm} : rs1_val;
   wire [31:0] csr_wdata =
         (csr_op == 2'b00) ? csr_src :              // csrrw / csrrwi
@@ -191,7 +216,8 @@ module ysyx_22040000(
     .clk(clock), .rst(reset),
     .csr_raddr(csr_addr), .csr_rdata(csr_rdata),
     .csr_we(csr_we_wb),
-    .csr_waddr(csr_addr), .csr_wdata(csr_wdata)
+    .csr_waddr(csr_addr), .csr_wdata(csr_wdata),
+    .mepc_out(mepc_w)
   );
 
   // ---- WBU + PC -------------------------------------------------------------
@@ -199,23 +225,20 @@ module ysyx_22040000(
   WBU u_wbu (
     .alu_result(alu_result), .load_data(load_data),
     .csr_rdata(csr_rdata),
-    .wb_sel(wb_sel), .is_jalr(is_jalr),
-    .pc(pc),
+    .wb_sel(wb_sel),
+    .is_jal(is_jal), .is_jalr(is_jalr),
+    .is_branch(is_branch), .branch_taken(branch_taken),
+    .is_mret(is_mret), .mepc(mepc_w),
+    .pc(pc), .imm(imm),
     .pc_next(pc_next), .wb_data(wb_data)
   );
 
   // ---- Bus outputs ----------------------------------------------------------
-  // Hold req high while waiting for resp. The bridge guarantees a single
-  // handshake per request.
   assign io_ifu_reqValid = (state == S_IF) & ~reset;
   assign io_ifu_addr     = {pc[31:2], 2'b00};
 
   wire ls_active = (state == S_LS);
   assign io_lsu_reqValid = ls_active & ~reset & (mem_re | mem_we);
-  // io_lsu_addr is the byte address per cpu-interface.md. Devices (APB UART
-  // in particular) use the low 3 bits to index their register file, so we
-  // MUST NOT zero them. The wmask + size already encode which bytes inside
-  // the word are active.
   assign io_lsu_addr     = alu_result;
   assign io_lsu_size     = mem_we ? store_size : load_size;
   assign io_lsu_wen      = mem_we;
@@ -247,15 +270,12 @@ module ysyx_22040000(
       lsu_rdata_r <= 32'h0;
     end else begin
       state <= next_state;
-      // Latch instruction when fetch handshake completes.
       if (state == S_IF && io_ifu_respValid) begin
         inst_r <= io_ifu_rdata;
       end
-      // Latch load data when LSU handshake completes (read path).
       if (state == S_LS && io_lsu_respValid && mem_re) begin
         lsu_rdata_r <= io_lsu_rdata;
       end
-      // Update PC on writeback only.
       if (state == S_WB && !is_ebreak) begin
         pc <= pc_next;
       end

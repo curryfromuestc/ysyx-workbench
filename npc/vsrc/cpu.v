@@ -1,12 +1,20 @@
-// Top-level single-cycle minirv CPU (D4/D5 DPI-C harness).
-// PC reset is configurable via the PC_RESET_VEC macro. Default 0x80000000 so
-// the existing minirv-npc runtime images keep booting; the SoC wrapper
-// (ysyx_22040000.v) provides its own 0x30000000 instance for D6.
+// Top-level single-cycle RV32E_Zicsr CPU.
 //
-// On posedge clk after reset:
-//   - inst is fetched combinationally via IFU (DPI-C pmem_read)
-//   - regfile/lsu/csr update on this clock edge
-//   - ebreak triggers DPI-C npc_trap (called from top via always @(posedge clk))
+// PC reset is configurable via the PC_RESET_VEC macro (default 0x80000000).
+// The SoC wrapper (ysyx_22040000.v) provides its own 0x30000000 instance.
+//
+// Pipeline (still single-cycle):
+//   IFU -> IDU -> EXU -> LSU -> WBU -> PC update
+//
+// PC redirect (handled in WBU):
+//   mret      -> mepc
+//   jal/jalr  -> imm-relative / (rs1+imm)&~1
+//   branch    -> rs1?rs2 comparison
+//   default   -> pc + 4
+//
+// `SYNTHESIS` strips the DPI-C trap hook and exposes ebreak status as ports
+// so yosys can lint the top.
+
 `ifndef PC_RESET_VEC
   `define PC_RESET_VEC 32'h8000_0000
 `endif
@@ -16,17 +24,14 @@ module cpu(
   input rst
 `ifdef SYNTHESIS
   ,
-  // IFU bus (replaces DPI-C pmem_read in IFU)
   output [31:0] ifu_pmem_raddr,
   input  [31:0] ifu_pmem_rdata,
-  // LSU bus (replaces DPI-C pmem_read/pmem_write in LSU)
   output [31:0] lsu_pmem_raddr,
   input  [31:0] lsu_pmem_rdata,
   output        lsu_pmem_wen,
   output [31:0] lsu_pmem_waddr,
   output [31:0] lsu_pmem_wdata,
   output [7:0]  lsu_pmem_wmask,
-  // ebreak status (replaces DPI-C npc_trap in cpu.v)
   output        npc_ebreak,
   output [31:0] npc_a0
 `endif
@@ -38,15 +43,19 @@ module cpu(
   wire [3:0]  rs1, rs2, rd;
   wire [31:0] imm;
   wire        alu_src;
-  wire [1:0]  alu_op;
+  wire [3:0]  alu_op;
+  wire        alu_use_pc;
   wire        mem_re, mem_we;
   wire [2:0]  funct3;
   wire [1:0]  wb_sel;
   wire        reg_wen;
+  wire        is_jal;
   wire        is_jalr;
+  wire        is_branch;
+  wire [2:0]  branch_op;
   wire        is_ebreak;
+  wire        is_mret;
 
-  // CSR ports
   wire        is_csr;
   wire [11:0] csr_addr_i;
   wire [4:0]  csr_uimm;
@@ -55,9 +64,11 @@ module cpu(
   wire        csr_we_i;
   wire [1:0]  csr_op;
   wire [31:0] csr_rdata;
+  wire [31:0] mepc_w;
 
   wire [31:0] rs1_val, rs2_val;
   wire [31:0] alu_result;
+  wire        branch_taken;
   wire [31:0] load_data;
   wire [31:0] wb_data;
 
@@ -74,12 +85,14 @@ module cpu(
   );
 
   IDU u_idu (
-    .inst(inst),
+    .inst(inst), .pc(pc),
     .rs1(rs1), .rs2(rs2), .rd(rd),
-    .imm(imm), .alu_src(alu_src), .alu_op(alu_op),
+    .imm(imm), .alu_src(alu_src), .alu_op(alu_op), .alu_use_pc(alu_use_pc),
     .mem_re(mem_re), .mem_we(mem_we), .funct3(funct3),
     .wb_sel(wb_sel), .reg_wen(reg_wen),
-    .is_jalr(is_jalr), .is_ebreak(is_ebreak),
+    .is_jal(is_jal), .is_jalr(is_jalr),
+    .is_branch(is_branch), .branch_op(branch_op),
+    .is_ebreak(is_ebreak), .is_mret(is_mret),
     .is_csr(is_csr), .csr_addr(csr_addr_i),
     .csr_uimm(csr_uimm), .csr_use_uimm(csr_use_uimm),
     .csr_re(csr_re_i), .csr_we(csr_we_i), .csr_op(csr_op)
@@ -93,9 +106,11 @@ module cpu(
   );
 
   EXU u_exu (
+    .pc(pc),
     .rs1_val(rs1_val), .rs2_val(rs2_val), .imm(imm),
-    .alu_src(alu_src), .alu_op(alu_op),
-    .alu_result(alu_result)
+    .alu_src(alu_src), .alu_use_pc(alu_use_pc), .alu_op(alu_op),
+    .branch_op(branch_op),
+    .alu_result(alu_result), .branch_taken(branch_taken)
   );
 
   LSU u_lsu (
@@ -111,7 +126,6 @@ module cpu(
   );
 
   // ---- CSR ------------------------------------------------------------------
-  // src for set/clear/write
   wire [31:0] csr_src = csr_use_uimm ? {27'b0, csr_uimm} : rs1_val;
   wire [31:0] csr_wdata =
         (csr_op == 2'b00) ? csr_src :              // csrrw / csrrwi
@@ -122,24 +136,23 @@ module cpu(
     .clk(clk), .rst(rst),
     .csr_raddr(csr_addr_i), .csr_rdata(csr_rdata),
     .csr_we(csr_we_i & ~rst & ~is_ebreak),
-    .csr_waddr(csr_addr_i), .csr_wdata(csr_wdata)
+    .csr_waddr(csr_addr_i), .csr_wdata(csr_wdata),
+    .mepc_out(mepc_w)
   );
 
   WBU u_wbu (
     .alu_result(alu_result), .load_data(load_data),
     .csr_rdata(csr_rdata),
-    .wb_sel(wb_sel), .is_jalr(is_jalr),
-    .pc(pc),
+    .wb_sel(wb_sel),
+    .is_jal(is_jal), .is_jalr(is_jalr),
+    .is_branch(is_branch), .branch_taken(branch_taken),
+    .is_mret(is_mret), .mepc(mepc_w),
+    .pc(pc), .imm(imm),
     .pc_next(pc_next), .wb_data(wb_data)
   );
 
   // ebreak hookup: synchronously notify the host.
-  //   - in simulation: call DPI-C npc_trap so the harness terminates the run.
-  //   - in synthesis : expose `npc_ebreak` (level) and `npc_a0` (x10) as ports
-  //     so the outer hierarchy can observe them without cross-module references.
 `ifdef SYNTHESIS
-  // Mirror x10 onto a port so we don't need a cross-hierarchy reference into
-  // u_rf.rf[10] (which yosys cannot resolve).
   RegFile_PORT_X10 u_rf_x10 (
     .clk(clk),
     .wen(reg_wen & ~rst & ~is_ebreak),
@@ -158,9 +171,8 @@ module cpu(
 endmodule
 
 `ifdef SYNTHESIS
-// Tiny shadow of regfile x10 used purely so the top-level can expose `a0` as
-// a port for synthesis without poking into the regfile internals. It snapshots
-// the writeback bus when (waddr == 10), so it always tracks x10.
+// Shadow of regfile x10 used so the top-level can expose `a0` as a port for
+// synthesis without poking into the regfile internals.
 module RegFile_PORT_X10(
   input         clk,
   input         wen,
