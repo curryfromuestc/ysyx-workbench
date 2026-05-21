@@ -7,10 +7,17 @@
 //   IFU -> IDU -> EXU -> LSU -> WBU -> PC update
 //
 // PC redirect (handled in WBU):
+//   ecall     -> mtvec (mcause/mepc latched in CSR same cycle)
 //   mret      -> mepc
 //   jal/jalr  -> imm-relative / (rs1+imm)&~1
 //   branch    -> rs1?rs2 comparison
 //   default   -> pc + 4
+//
+// ECALL trap (C5a):
+//   When IDU asserts is_ecall, the CSR file latches mcause<=a5 (syscall number;
+//   in ilp32e the toolchain places the syscall number in a5/x15) and mepc<=pc.
+//   The WBU then redirects PC to mtvec. Software (cte.c) advances mepc by 4
+//   before mret to skip past the ecall.
 //
 // `SYNTHESIS` strips the DPI-C trap hook and exposes ebreak status as ports
 // so yosys can lint the top.
@@ -55,6 +62,7 @@ module cpu(
   wire [2:0]  branch_op;
   wire        is_ebreak;
   wire        is_mret;
+  wire        is_ecall;
 
   wire        is_csr;
   wire [11:0] csr_addr_i;
@@ -65,6 +73,8 @@ module cpu(
   wire [1:0]  csr_op;
   wire [31:0] csr_rdata;
   wire [31:0] mepc_w;
+  wire [31:0] mtvec_w;
+  wire [31:0] a5_val;
 
   wire [31:0] rs1_val, rs2_val;
   wire [31:0] alu_result;
@@ -92,7 +102,7 @@ module cpu(
     .wb_sel(wb_sel), .reg_wen(reg_wen),
     .is_jal(is_jal), .is_jalr(is_jalr),
     .is_branch(is_branch), .branch_op(branch_op),
-    .is_ebreak(is_ebreak), .is_mret(is_mret),
+    .is_ebreak(is_ebreak), .is_mret(is_mret), .is_ecall(is_ecall),
     .is_csr(is_csr), .csr_addr(csr_addr_i),
     .csr_uimm(csr_uimm), .csr_use_uimm(csr_use_uimm),
     .csr_re(csr_re_i), .csr_we(csr_we_i), .csr_op(csr_op)
@@ -102,6 +112,9 @@ module cpu(
     .clk(clk),
     .raddr1(rs1), .rdata1(rs1_val),
     .raddr2(rs2), .rdata2(rs2_val),
+    // raddr3 is hard-wired to a5 (x15) so the trap path can latch the syscall
+    // number into mcause on ecall. ilp32e places the syscall number in a5.
+    .raddr3(4'd15), .rdata3(a5_val),
     .wdata(wb_data), .waddr(rd), .wen(reg_wen & ~rst & ~is_ebreak)
   );
 
@@ -132,12 +145,18 @@ module cpu(
         (csr_op == 2'b01) ? (csr_rdata | csr_src): // csrrs / csrrsi
         (csr_op == 2'b10) ? (csr_rdata & ~csr_src):// csrrc / csrrci
                             csr_src;
+  // Trap on ecall: single-cycle pulse to CSR + WBU. trap_cause copies a5 to
+  // mirror NEMU's R(a7) semantic (under ilp32e the syscall number lives in
+  // a5/x15). trap_epc is the ecall PC itself; cte.c is responsible for
+  // advancing mepc by 4 before mret.
+  wire        trap_fire = is_ecall & ~rst;
   CSR u_csr (
     .clk(clk), .rst(rst),
     .csr_raddr(csr_addr_i), .csr_rdata(csr_rdata),
     .csr_we(csr_we_i & ~rst & ~is_ebreak),
     .csr_waddr(csr_addr_i), .csr_wdata(csr_wdata),
-    .mepc_out(mepc_w)
+    .is_trap(trap_fire), .trap_cause(a5_val), .trap_epc(pc),
+    .mepc_out(mepc_w), .mtvec_out(mtvec_w)
   );
 
   WBU u_wbu (
@@ -147,6 +166,7 @@ module cpu(
     .is_jal(is_jal), .is_jalr(is_jalr),
     .is_branch(is_branch), .branch_taken(branch_taken),
     .is_mret(is_mret), .mepc(mepc_w),
+    .is_trap(trap_fire), .mtvec(mtvec_w),
     .pc(pc), .imm(imm),
     .pc_next(pc_next), .wb_data(wb_data)
   );

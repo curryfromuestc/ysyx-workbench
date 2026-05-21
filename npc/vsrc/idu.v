@@ -46,6 +46,7 @@ module IDU(
   output [2:0]  branch_op,      // == funct3 of BRANCH opcode
   output        is_ebreak,
   output        is_mret,
+  output        is_ecall,
   // CSR side
   output        is_csr,
   output [11:0] csr_addr,
@@ -98,6 +99,10 @@ module IDU(
 
   assign is_ebreak = (inst == 32'h00100073);
   assign is_mret   = (inst == 32'h30200073);
+  // ecall encoding: imm=0, rs1=0, funct3=000, rd=0, opcode=SYSTEM. Match the
+  // exact bit pattern so we don't confuse it with ebreak (imm=1) or any other
+  // SYSTEM-class instruction (mret, csr*).
+  assign is_ecall  = (inst == 32'h00000073);
 
   assign csr_addr     = inst[31:20];
   assign csr_uimm     = inst[19:15];
@@ -199,10 +204,11 @@ module IDU(
   // ---- writeback enable ----------------------------------------------------
   // Any instruction that has an architectural destination. RV spec quirks:
   // - x0 in regfile is silently ignored (RegFile checks waddr).
-  // - ebreak / mret / fence / store / branch / system-no-csr do not write.
+  // - ebreak / mret / ecall / fence / store / branch / system-no-csr do not write.
   wire wb_arith   = is_op | is_op_imm | is_lui_op | is_auipc_op;
   wire wb_load    = is_load_op;
   wire wb_jump    = is_jal_op | is_jalr_op;
   wire wb_csr     = is_csr;
-  assign reg_wen = (wb_arith | wb_load | wb_jump | wb_csr) & ~is_ebreak & ~is_mret;
+  assign reg_wen = (wb_arith | wb_load | wb_jump | wb_csr)
+                   & ~is_ebreak & ~is_mret & ~is_ecall;
 endmodule

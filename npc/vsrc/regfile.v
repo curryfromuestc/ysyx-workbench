@@ -1,5 +1,9 @@
 // 16-entry GPR file (RV32E). x0 hardwired to 0.
-// Async read, sync write on posedge clk.
+// Async read (three independent read ports), sync write on posedge clk.
+//
+// Read port 3 (raddr3 / rdata3) is added so the CTE trap path can sample the
+// syscall-number register (a5 under ilp32e) without poking into the regfile
+// internals via a hierarchical reference. Synthesisable.
 module RegFile #(
   parameter ADDR_WIDTH = 4,
   parameter DATA_WIDTH = 32
@@ -9,6 +13,8 @@ module RegFile #(
   output [DATA_WIDTH-1:0]  rdata1,
   input  [ADDR_WIDTH-1:0]  raddr2,
   output [DATA_WIDTH-1:0]  rdata2,
+  input  [ADDR_WIDTH-1:0]  raddr3,
+  output [DATA_WIDTH-1:0]  rdata3,
   input  [DATA_WIDTH-1:0]  wdata,
   input  [ADDR_WIDTH-1:0]  waddr,
   input                    wen
@@ -26,4 +32,5 @@ module RegFile #(
 
   assign rdata1 = (raddr1 == {ADDR_WIDTH{1'b0}}) ? {DATA_WIDTH{1'b0}} : rf[raddr1];
   assign rdata2 = (raddr2 == {ADDR_WIDTH{1'b0}}) ? {DATA_WIDTH{1'b0}} : rf[raddr2];
+  assign rdata3 = (raddr3 == {ADDR_WIDTH{1'b0}}) ? {DATA_WIDTH{1'b0}} : rf[raddr3];
 endmodule

@@ -1,11 +1,12 @@
 // WBU: writeback data mux + next-PC selector.
 //
 // PC redirect priority (highest to lowest):
-//   1. is_mret           : pc_next = mepc (from CSR file)
-//   2. is_jal            : pc_next = pc + imm_j  (consumed via jal_target)
-//   3. is_jalr           : pc_next = alu_result  (already (rs1+imm)&~1)
-//   4. is_branch & taken : pc_next = pc + imm_b  (consumed via branch_target)
-//   5. default           : pc_next = pc + 4
+//   1. is_trap           : pc_next = mtvec  (ecall / future exceptions)
+//   2. is_mret           : pc_next = mepc   (from CSR file)
+//   3. is_jal            : pc_next = pc + imm_j  (consumed via jal_target)
+//   4. is_jalr           : pc_next = alu_result  (already (rs1+imm)&~1)
+//   5. is_branch & taken : pc_next = pc + imm_b  (consumed via branch_target)
+//   6. default           : pc_next = pc + 4
 //
 // wb_sel selects the write-back DATA only; PC redirect is independent.
 module WBU(
@@ -19,6 +20,8 @@ module WBU(
   input         branch_taken,
   input         is_mret,
   input  [31:0] mepc,
+  input         is_trap,
+  input  [31:0] mtvec,
   input  [31:0] pc,
   input  [31:0] imm,           // imm_j when is_jal, imm_b when is_branch
   output [31:0] pc_next,
@@ -35,6 +38,7 @@ module WBU(
   wire [31:0] pc_jal     = pc + imm;          // imm_j
 
   assign pc_next =
+      is_trap                    ? mtvec     :
       is_mret                    ? mepc      :
       is_jal                     ? pc_jal    :
       is_jalr                    ? alu_result :

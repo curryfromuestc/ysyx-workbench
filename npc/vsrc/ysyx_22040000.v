@@ -72,6 +72,7 @@ module ysyx_22040000(
   wire [2:0]  branch_op;
   wire        is_ebreak;
   wire        is_mret;
+  wire        is_ecall;
   wire        is_csr;
   wire [11:0] csr_addr;
   wire [4:0]  csr_uimm;
@@ -88,14 +89,14 @@ module ysyx_22040000(
     .wb_sel(wb_sel), .reg_wen(reg_wen_dec),
     .is_jal(is_jal), .is_jalr(is_jalr),
     .is_branch(is_branch), .branch_op(branch_op),
-    .is_ebreak(is_ebreak), .is_mret(is_mret),
+    .is_ebreak(is_ebreak), .is_mret(is_mret), .is_ecall(is_ecall),
     .is_csr(is_csr), .csr_addr(csr_addr),
     .csr_uimm(csr_uimm), .csr_use_uimm(csr_use_uimm),
     .csr_re(csr_re), .csr_we(csr_we_dec), .csr_op(csr_op)
   );
 
   // ---- Register file --------------------------------------------------------
-  wire [31:0] rs1_val, rs2_val;
+  wire [31:0] rs1_val, rs2_val, a5_val;
   wire [31:0] wb_data;
   wire        reg_wen_wb = reg_wen_dec & (state == S_WB) & ~is_ebreak;
 
@@ -103,6 +104,8 @@ module ysyx_22040000(
     .clk(clock),
     .raddr1(rs1_a), .rdata1(rs1_val),
     .raddr2(rs2_a), .rdata2(rs2_val),
+    // raddr3 dedicated to a5 (x15) for the CTE trap path under ilp32e.
+    .raddr3(4'd15), .rdata3(a5_val),
     .wdata(wb_data), .waddr(rd_a), .wen(reg_wen_wb)
   );
 
@@ -205,6 +208,7 @@ module ysyx_22040000(
   // ---- CSR ------------------------------------------------------------------
   wire [31:0] csr_rdata;
   wire [31:0] mepc_w;
+  wire [31:0] mtvec_w;
   wire [31:0] csr_src = csr_use_uimm ? {27'b0, csr_uimm} : rs1_val;
   wire [31:0] csr_wdata =
         (csr_op == 2'b00) ? csr_src :              // csrrw / csrrwi
@@ -212,12 +216,16 @@ module ysyx_22040000(
         (csr_op == 2'b10) ? (csr_rdata & ~csr_src):// csrrc / csrrci
                             csr_src;
   wire csr_we_wb = csr_we_dec & (state == S_WB) & ~is_ebreak;
+  // Same one-shot rule as csr_we_wb: only commit the trap during S_WB so we
+  // don't double-write mcause/mepc and don't redirect PC mid-fetch.
+  wire trap_fire = is_ecall & (state == S_WB) & ~reset;
   CSR u_csr (
     .clk(clock), .rst(reset),
     .csr_raddr(csr_addr), .csr_rdata(csr_rdata),
     .csr_we(csr_we_wb),
     .csr_waddr(csr_addr), .csr_wdata(csr_wdata),
-    .mepc_out(mepc_w)
+    .is_trap(trap_fire), .trap_cause(a5_val), .trap_epc(pc),
+    .mepc_out(mepc_w), .mtvec_out(mtvec_w)
   );
 
   // ---- WBU + PC -------------------------------------------------------------
@@ -229,6 +237,7 @@ module ysyx_22040000(
     .is_jal(is_jal), .is_jalr(is_jalr),
     .is_branch(is_branch), .branch_taken(branch_taken),
     .is_mret(is_mret), .mepc(mepc_w),
+    .is_trap(trap_fire), .mtvec(mtvec_w),
     .pc(pc), .imm(imm),
     .pc_next(pc_next), .wb_data(wb_data)
   );
