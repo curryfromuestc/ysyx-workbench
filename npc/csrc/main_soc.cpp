@@ -173,9 +173,10 @@ int main(int argc, char **argv) {
   fprintf(stderr, "npc-soc: B2a access-fault events: %llu\n",
           (unsigned long long)fault_events);
 
-  // B4a/B4b: 退出前打印 icache 性能计数器 (verilator 通过 public_flat_rd 把它们
-  // 抬到 root scope 的扁平符号表里). B4b 新增 cnt_victim (理论上 == cnt_miss,
-  // 作为 LRU 选 victim 的 sanity check).
+  // B4a/B4b/B4c: 退出前打印 icache 性能计数器 (verilator 通过 public_flat_rd
+  // 把它们抬到 root scope 的扁平符号表里). cnt_victim 理论上 == cnt_miss,
+  // 是 LRU 选 victim 的 sanity check.
+  // B4c 加打印一行 cycle 数 + cycles-per-access, 方便对比不同块大小配置.
   uint64_t ic_access = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_access;
   uint64_t ic_hit    = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_hit;
   uint64_t ic_miss   = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_miss;
@@ -187,6 +188,9 @@ int main(int argc, char **argv) {
           (unsigned long long)ic_miss,
           hit_rate,
           (unsigned long long)ic_victim);
+  fprintf(stderr, "npc-soc: total_cycles=%llu access/miss/hit ratio: %.3f cyc/access\n",
+          (unsigned long long)cycle_cnt,
+          (ic_access == 0) ? 0.0 : (double)cycle_cnt / (double)ic_access);
 
   delete top;
   return 0;
