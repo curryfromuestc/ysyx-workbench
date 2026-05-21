@@ -5,7 +5,11 @@ void __am_timer_init() {
 }
 
 void __am_timer_uptime(AM_TIMER_UPTIME_T *uptime) {
-  uptime->us = 0;
+  // NEMU's RTC handler only refreshes both registers on a read at offset 4
+  // (high 32 bits). Reading low first would give a stale low half.
+  uint32_t hi = inl(RTC_ADDR + 4);
+  uint32_t lo = inl(RTC_ADDR);
+  uptime->us = ((uint64_t)hi << 32) | lo;
 }
 
 void __am_timer_rtc(AM_TIMER_RTC_T *rtc) {

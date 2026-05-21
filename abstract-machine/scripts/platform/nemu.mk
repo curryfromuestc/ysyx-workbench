@@ -7,12 +7,25 @@ AM_SRCS := platform/nemu/trm.c \
            platform/nemu/ioe/disk.c \
            platform/nemu/mpe.c
 
+# Fallback so `make ARCH=riscv32-nemu run` works even when the user shell
+# does not export NEMU_HOME (e.g. orchestrator subprocesses spawned via
+# /bin/sh -c, which does not source ~/.bashrc). Use ifeq so we also catch
+# the case where NEMU_HOME is exported but empty (?= would leave that alone).
+# Assumes the standard ysyx-workbench layout: nemu/ next to abstract-machine/.
+ifeq ($(strip $(NEMU_HOME)),)
+NEMU_HOME := $(abspath $(AM_HOME)/../nemu)
+endif
+# Export so nested `$(MAKE) -C $(NEMU_HOME)` (and the tracer hooks in the
+# top-level ysyx-workbench/Makefile that compute YSYX_HOME = NEMU_HOME/..)
+# also see a non-empty value.
+export NEMU_HOME
+
 CFLAGS    += -fdata-sections -ffunction-sections
 CFLAGS    += -I$(AM_HOME)/am/src/platform/nemu/include
 LDSCRIPTS += $(AM_HOME)/scripts/linker.ld
 LDFLAGS   += --defsym=_pmem_start=0x80000000 --defsym=_entry_offset=0x0
 LDFLAGS   += --gc-sections -e _start
-NEMUFLAGS += -l $(shell dirname $(IMAGE).elf)/nemu-log.txt
+NEMUFLAGS += -l $(shell dirname $(IMAGE).elf)/nemu-log.txt -b
 
 MAINARGS_MAX_LEN = 64
 MAINARGS_PLACEHOLDER = the_insert-arg_rule_in_Makefile_will_insert_mainargs_here
