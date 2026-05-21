@@ -173,6 +173,18 @@ int main(int argc, char **argv) {
   fprintf(stderr, "npc-soc: B2a access-fault events: %llu\n",
           (unsigned long long)fault_events);
 
+  // B4a: 退出前打印 icache 性能计数器 (verilator 通过 public_flat_rd 把它们
+  // 抬到 root scope 的扁平符号表里).
+  uint64_t ic_access = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_access;
+  uint64_t ic_hit    = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_hit;
+  uint64_t ic_miss   = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_miss;
+  double hit_rate = (ic_access == 0) ? 0.0 : (double)ic_hit * 100.0 / (double)ic_access;
+  fprintf(stderr, "npc-soc: icache access=%llu hit=%llu miss=%llu hit_rate=%.2f%%\n",
+          (unsigned long long)ic_access,
+          (unsigned long long)ic_hit,
+          (unsigned long long)ic_miss,
+          hit_rate);
+
   delete top;
   return 0;
 }

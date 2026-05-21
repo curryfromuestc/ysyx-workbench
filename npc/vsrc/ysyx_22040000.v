@@ -25,6 +25,10 @@
   `define SOC_PC_RESET_VEC 32'h3000_0000
 `endif
 
+// B4a: icache 模块定义通过 `include 拉进来 (不改 Makefile 的源文件列表).
+// 路径相对于 verilator 的工作目录 (npc/), 与 Makefile $(TOPDIR) 一致.
+`include "vsrc/icache.v"
+
 module ysyx_22040000(
   input         clock,
   input         reset,
@@ -63,7 +67,9 @@ module ysyx_22040000(
   // ---- PC and latched instruction ------------------------------------------
   reg  [31:0] pc;
   reg  [31:0] inst_r;
-  wire [31:0] inst = (state == S_IF) ? io_ifu_rdata : inst_r;
+  // B4a: 取指数据来自 icache (而不是直接从 bus). icache 在 hit 时同周期返回,
+  // miss 时填表后那一拍返回. 上游 FSM 不需要关心.
+  wire [31:0] inst = (state == S_IF) ? ifu_cpu_resp_data : inst_r;
 
   // ---- Decode (combinational, on `inst`) -----------------------------------
   wire [3:0]  rs1_a, rs2_a, rd_a;
@@ -252,8 +258,26 @@ module ysyx_22040000(
   );
 
   // ---- Bus outputs ----------------------------------------------------------
-  assign io_ifu_reqValid = (state == S_IF) & ~reset;
-  assign io_ifu_addr     = {pc[31:2], 2'b00};
+  // B4a: 在 IFU 通路里塞一个 icache. 直接映射, 16 块 x 4B = 64B, 触发器实现.
+  // CPU FSM -> icache 上游 (req_valid / resp_valid 同协议)
+  // icache 下游 -> 外部 SimpleBus 端口 io_ifu_* (协议不变)
+  wire        ifu_cpu_req_valid  = (state == S_IF) & ~reset;
+  wire [31:0] ifu_cpu_req_addr   = {pc[31:2], 2'b00};
+  wire        ifu_cpu_resp_valid;
+  wire [31:0] ifu_cpu_resp_data;
+
+  icache #(.BLOCKS_LOG(4), .OFFSET_LOG(2)) u_icache (
+    .clock          (clock),
+    .reset          (reset),
+    .req_valid      (ifu_cpu_req_valid),
+    .req_addr       (ifu_cpu_req_addr),
+    .resp_valid     (ifu_cpu_resp_valid),
+    .resp_data      (ifu_cpu_resp_data),
+    .bus_req_valid  (io_ifu_reqValid),
+    .bus_req_addr   (io_ifu_addr),
+    .bus_resp_valid (io_ifu_respValid),
+    .bus_resp_data  (io_ifu_rdata)
+  );
 
   wire ls_active = (state == S_LS);
   assign io_lsu_reqValid = ls_active & ~reset & (mem_re | mem_we);
@@ -269,7 +293,11 @@ module ysyx_22040000(
   // high; we further gate by the current FSM state so that a stale fault
   // signal in some other state (which the bridge does not produce today
   // anyway) can never poison an instruction it shouldn't.
-  wire ifu_fault = (state == S_IF) & io_ifu_respValid & io_fault;
+  // NOTE B4a: 引入 icache 后, IFU 的 fault 检测口径相应改成 "icache 上游
+  // resp_valid". 当 miss + bus 返 fault 时, icache 把 bus_resp_valid (= 1) +
+  // bus_resp_data (junk) 同步抛给上游, 此时 io_fault 在 bus 侧依然有效 ->
+  // 同周期 ifu_cpu_resp_valid 也 = 1, 我们用它来 latch fault.
+  wire ifu_fault = (state == S_IF) & ifu_cpu_resp_valid & io_fault;
   wire lsu_fault = (state == S_LS) & io_lsu_respValid & io_fault;
   wire any_fault = ifu_fault | lsu_fault;
 
@@ -288,8 +316,10 @@ module ysyx_22040000(
     next_state = state;
     case (state)
       // On IFU fault: skip decode entirely and restart fetch (PC <= 0).
-      S_IF: if (ifu_fault)               next_state = S_IF;
-            else if (io_ifu_respValid)   next_state = S_EX;
+      // B4a: 等待 icache 的 resp_valid (而不是直接看 bus respValid). 在 hit
+      // 时 ifu_cpu_resp_valid 与 ifu_cpu_req_valid 同周期 -> 单拍取指完成.
+      S_IF: if (ifu_fault)                  next_state = S_IF;
+            else if (ifu_cpu_resp_valid)    next_state = S_EX;
       S_EX: begin
         if (is_ebreak)                 next_state = S_EX; // park forever on ebreak
         else if (mem_re | mem_we)      next_state = S_LS;
@@ -316,8 +346,10 @@ module ysyx_22040000(
       // Latch the IFU result only on a clean fetch; on fault, leave inst_r
       // alone so we never decode the (likely zero) rdata that came with the
       // SLVERR response.
-      if (state == S_IF && io_ifu_respValid && !ifu_fault) begin
-        inst_r <= io_ifu_rdata;
+      // B4a: 现在 latch icache 返回的数据 (hit 时来自 cache; miss 时 cache
+      // 同周期透传 bus 数据), 而不是 bus rdata.
+      if (state == S_IF && ifu_cpu_resp_valid && !ifu_fault) begin
+        inst_r <= ifu_cpu_resp_data;
       end
       // Same idea on the load side: a fault response brings back junk
       // rdata; don't latch it, so even if some downstream consumer peeks
