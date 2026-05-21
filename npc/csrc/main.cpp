@@ -20,7 +20,16 @@
 #define PMEM_END    (PMEM_BASE + PMEM_SIZE)
 
 // MMIO devices (NPC side; kept in sync with am/src/platform/npc/include/npc.h)
-#define SERIAL_PORT_ADDR  0x10000000u
+//
+// We expose a partial UART16550 register file at 0x10000000 so the same AM
+// `putch()` works against both the D4/D5 DPI harness AND the D6c ysyxSoC
+// harness (where the real UART16550 IP from `ysyxSoC/perip/uart16550/rtl/`
+// sits). The eight UART regs are byte-wide, packed into two host-side words
+// at 0x10000000 (THR/DLL, IER/DLM, IIR/FCR, LCR) and 0x10000004 (MCR, LSR,
+// MSR, SCR). LSU writes always arrive aligned-to-4 with `wmask` selecting
+// the byte; LSU reads arrive aligned-to-4 and the RTL picks the byte itself.
+#define UART_BASE_W0      0x10000000u  // word containing THR/DLL .. LCR
+#define UART_BASE_W1      0x10000004u  // word containing MCR .. SCR
 #define RTC_ADDR_LO       0xa0000048u
 #define RTC_ADDR_HI       0xa000004cu
 
@@ -58,6 +67,11 @@ static uint64_t get_uptime_us() {
 static uint32_t rtc_lo_latched = 0;
 static uint32_t rtc_hi_latched = 0;
 
+// UART16550 minimal model: we only care about DLAB so writes go to the right
+// "page". The transmitter is unconditionally idle (THRE=1, TEMT=1) which
+// makes AM's `while (!(LSR & 0x20))` poll return immediately.
+static bool uart_dlab = false;
+
 static uint32_t mmio_read(uint32_t addr) {
   if (addr == RTC_ADDR_HI) {
     uint64_t us = get_uptime_us();
@@ -66,6 +80,16 @@ static uint32_t mmio_read(uint32_t addr) {
     return rtc_hi_latched;
   }
   if (addr == RTC_ADDR_LO) return rtc_lo_latched;
+  if (addr == UART_BASE_W0) {
+    // RBR / DLL / IER / DLM / IIR / LCR. We never receive characters and we
+    // do not care what the FW reads from LCR.
+    return 0;
+  }
+  if (addr == UART_BASE_W1) {
+    // LSR is byte 1 of this word. THRE (bit 5) | TEMT (bit 6) == 0x60 makes
+    // the polling loop in AM's putch() pass on the first read.
+    return 0x00006000u;
+  }
   return 0;
 }
 
@@ -75,14 +99,28 @@ static void mmio_write(uint32_t addr, uint32_t data, uint8_t mask) {
   // makes each store fire the MMIO side effect exactly once.
   if (top == nullptr || top->clk != 0) return;
 
-  if (addr == SERIAL_PORT_ADDR && (mask & 0x1)) {
-    putchar((char)(data & 0xff));
-    fflush(stdout);
+  if (addr == UART_BASE_W0) {
+    // Byte 0 -> THR (if DLAB=0) or DLL (if DLAB=1). Byte 1 -> IER / DLM.
+    // Byte 3 -> LCR (always, regardless of DLAB; controls DLAB itself).
+    if ((mask & 0x8) != 0) {
+      uart_dlab = ((data >> 24) & 0x80u) != 0;
+    }
+    if ((mask & 0x1) != 0 && !uart_dlab) {
+      putchar((char)(data & 0xffu));
+      fflush(stdout);
+    }
+    // Other writes (DLL/DLM/IER/IIR/FCR) are silently dropped.
+    return;
+  }
+  if (addr == UART_BASE_W1) {
+    // MCR / LSR / MSR / SCR -- nothing to do for this harness.
+    return;
   }
 }
 
 static inline bool in_mmio(uint32_t addr) {
-  return addr == SERIAL_PORT_ADDR
+  return addr == UART_BASE_W0
+      || addr == UART_BASE_W1
       || addr == RTC_ADDR_LO
       || addr == RTC_ADDR_HI;
 }

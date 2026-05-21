@@ -212,7 +212,11 @@ module ysyx_22040000(
 
   wire ls_active = (state == S_LS);
   assign io_lsu_reqValid = ls_active & ~reset & (mem_re | mem_we);
-  assign io_lsu_addr     = {alu_result[31:2], 2'b00};
+  // io_lsu_addr is the byte address per cpu-interface.md. Devices (APB UART
+  // in particular) use the low 3 bits to index their register file, so we
+  // MUST NOT zero them. The wmask + size already encode which bytes inside
+  // the word are active.
+  assign io_lsu_addr     = alu_result;
   assign io_lsu_size     = mem_we ? store_size : load_size;
   assign io_lsu_wen      = mem_we;
   assign io_lsu_wdata    = store_word;
