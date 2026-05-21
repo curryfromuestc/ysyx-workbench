@@ -191,21 +191,17 @@ module icache #(
   wire [BLOCK_BITS-1:0] done_block = data_arr[miss_index_r][miss_way_r];
 
   // 取出第 woff 个 word: block[32*(woff+1)-1 : 32*woff].
-  // Verilog 不允许动态 +: 起点直接来自 reg, 需要 *32. WORD_LOG=0 时直接取低 32.
+  // Verilog 的 +: 起点不能是变量, 用 for 循环展开为 mux. BLOCK_WORDS=1 时
+  // 退化为单次 iw=0 命中, 等价直接取低 32 位.
   reg [31:0] hit_word;
   reg [31:0] done_word;
   integer iw;
   always @(*) begin
     hit_word  = 32'h0;
     done_word = 32'h0;
-    if (BLOCK_WORDS == 1) begin
-      hit_word  = hit_block[31:0];
-      done_word = done_block[31:0];
-    end else begin
-      for (iw = 0; iw < BLOCK_WORDS; iw = iw + 1) begin
-        if (iw[WCNT_W-1:0] == req_woff)    hit_word  = hit_block [iw*32 +: 32];
-        if (iw[WCNT_W-1:0] == miss_woff_r) done_word = done_block[iw*32 +: 32];
-      end
+    for (iw = 0; iw < BLOCK_WORDS; iw = iw + 1) begin
+      if (iw[WCNT_W-1:0] == req_woff)    hit_word  = hit_block [iw*32 +: 32];
+      if (iw[WCNT_W-1:0] == miss_woff_r) done_word = done_block[iw*32 +: 32];
     end
   end
 
@@ -286,16 +282,12 @@ module icache #(
 
       // S_FILL 收到一拍 resp: 写入 data_arr 的对应 word slot, fill_cnt+1.
       // 最后一拍同时把 valid / tag 写好 (LRU 在 done_resp 那一拍更新).
+      // 动态写 word slot: +: 起点不能是变量, 走 for 循环展开 case-on-fill_cnt.
+      // BLOCK_WORDS=1 时退化为单次 iw=0 命中, 直接写低 32 位.
       if ((state == S_FILL) & bus_resp_valid) begin
-        if (BLOCK_WORDS == 1) begin
-          data_arr[miss_index_r][miss_way_r][31:0] <= bus_resp_data;
-        end else begin
-          // 动态写入 word slot: 因为 +: 起点不能是变量, 走 case-on-fill_cnt.
-          // 用一段 for 循环展开等价 case.
-          for (iw = 0; iw < BLOCK_WORDS; iw = iw + 1) begin
-            if (iw[WCNT_W-1:0] == fill_cnt)
-              data_arr[miss_index_r][miss_way_r][iw*32 +: 32] <= bus_resp_data;
-          end
+        for (iw = 0; iw < BLOCK_WORDS; iw = iw + 1) begin
+          if (iw[WCNT_W-1:0] == fill_cnt)
+            data_arr[miss_index_r][miss_way_r][iw*32 +: 32] <= bus_resp_data;
         end
         if (fill_last) begin
           valid_arr[miss_index_r][miss_way_r] <= 1'b1;
