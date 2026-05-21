@@ -174,12 +174,11 @@ module icache #(
   always @(*) begin
     next_state = state;
     case (state)
-      S_IDLE: if (req_valid & ~hit & ~flush) next_state = S_FILL;
-      S_FILL: if (flush)                    next_state = bus_resp_valid ? S_IDLE : S_DRAIN;
-              else if (fill_last)           next_state = S_DONE;
-      S_DONE:                               next_state = S_IDLE;
-      S_DRAIN: if (bus_resp_valid)          next_state = S_IDLE;
-      default:                              next_state = S_IDLE;
+      S_IDLE:  if (req_valid & ~hit & ~flush) next_state = S_FILL;
+      S_FILL:  if (flush)                     next_state = bus_resp_valid ? S_IDLE : S_DRAIN;
+               else if (fill_last)            next_state = S_DONE;
+      S_DONE:                                 next_state = S_IDLE;
+      S_DRAIN: if (bus_resp_valid)            next_state = S_IDLE;
     endcase
   end
 

@@ -608,7 +608,6 @@ module ysyx_22040000(
   assign ifu_flush = flush_ex | flush_wb | flush_fault;
 
   wire pipe_freeze = ebreak_park | mem_stall;
-  wire if_id_hold  = pipe_freeze | id_hazard;       // IF/ID 是否保持
   wire id_ex_inject_bubble = pipe_freeze ? 1'b0 :
                              (id_hazard | flush_ex | flush_wb | flush_fault);
   wire ex_mem_inject_bubble = pipe_freeze ? 1'b0 :
@@ -882,14 +881,10 @@ module ysyx_22040000(
     end
   end
 
-  // wb_advanced: 与 mem_wb_* 平行驱动. 反映本拍 MEM/WB 是否真的吸入新指令.
-  // - reset / pipe_freeze / mem_wb_inject_bubble: 0
-  // - 其余: ex_mem_valid (上拍 EX/MEM 段是否有效)
+  // wb_advanced: 本拍 MEM/WB 是否真的吸入新指令. freeze 时整条流水线 hold,
+  // mem_wb_valid 会保持高但没有新指令到位, difftest 不能据此 step REF.
   always @(posedge clock) begin
-    if (reset)                       wb_advanced <= 1'b0;
-    else if (pipe_freeze)            wb_advanced <= 1'b0;
-    else if (mem_wb_inject_bubble)   wb_advanced <= 1'b0;
-    else                             wb_advanced <= ex_mem_valid;
+    wb_advanced <= ~reset & ~pipe_freeze & ~mem_wb_inject_bubble & ex_mem_valid;
   end
 
 endmodule

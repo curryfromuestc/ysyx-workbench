@@ -69,25 +69,18 @@ module cpu_pipeline(
   import "DPI-C" function void pmem_write(input int waddr, input int wdata, input byte wmask);
   import "DPI-C" function void npc_trap(input int code);
 
-  // IFU path: combinational read (one-cycle bridge). icache will see
-  // bus_resp_valid every cycle it asserts bus_req_valid, so multi-beat fill
-  // takes BLOCK_WORDS cycles.
-  reg [31:0] ifu_rdata_r;
-  always @(*) begin
-    ifu_rdata_r = pmem_read({io_ifu_addr[31:2], 2'b00});
-  end
+  // IFU / LSU 数据通路: 单拍 DPI mem 桥. reqValid 拉低时不调 pmem_read,
+  // 避免 verilator 每次 eval 都跨 SV/C 边界 (clk=0/clk=1 两拍 = 4 次 DPI
+  // per cycle), 在 reqValid=0 那些拍纯属浪费.
   assign io_ifu_respValid = io_ifu_reqValid & ~rst;
-  assign io_ifu_rdata     = ifu_rdata_r;
+  assign io_ifu_rdata     = io_ifu_reqValid
+                          ? pmem_read({io_ifu_addr[31:2], 2'b00})
+                          : 32'h0;
 
-  // LSU path: combinational read (loads) + posedge write (stores). For
-  // stores wmask = io_lsu_wmask; we extend wmask byte width: pmem_write's
-  // wmask is the same 4-bit format used by D5 (one bit per byte lane).
-  reg [31:0] lsu_rdata_r;
-  always @(*) begin
-    lsu_rdata_r = pmem_read({io_lsu_addr[31:2], 2'b00});
-  end
   assign io_lsu_respValid = io_lsu_reqValid & ~rst;
-  assign io_lsu_rdata     = lsu_rdata_r;
+  assign io_lsu_rdata     = (io_lsu_reqValid & ~io_lsu_wen)
+                          ? pmem_read({io_lsu_addr[31:2], 2'b00})
+                          : 32'h0;
 
   always @(posedge clk) begin
     if (!rst && io_lsu_reqValid && io_lsu_wen) begin
