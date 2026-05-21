@@ -64,53 +64,7 @@ module tb_psram;
     .dio   (dio)
   );
 
-  // ---------------------------------------------------------------------------
-  // APB master tasks.
-  // ---------------------------------------------------------------------------
-  // APB write. The controller (EF_PSRAM_CTRL_wb) treats every cycle where
-  // psel=1 as a potentially fresh request (it only inspects penable to
-  // distinguish setup vs access at the very top of its FSM), so we MUST
-  // deassert psel within the same cycle that pready goes high -- otherwise
-  // it would treat the held-high psel as a back-to-back duplicate request.
-  task automatic apb_write32(input [31:0] addr, input [31:0] data);
-    begin
-      @(posedge clock); #1;
-      paddr   = addr;
-      pwdata  = data;
-      pwrite  = 1'b1;
-      pstrb   = 4'b1111;
-      psel    = 1'b1;
-      penable = 1'b0;
-      @(posedge clock); #1;
-      penable = 1'b1;
-      // Wait for slave-side pready=1, then drop psel immediately.
-      while (!pready) @(posedge clock);
-      #1;
-      psel    = 1'b0;
-      penable = 1'b0;
-      pwrite  = 1'b0;
-      pstrb   = 4'b0;
-    end
-  endtask
-
-  task automatic apb_read32(input [31:0] addr, output [31:0] data);
-    begin
-      @(posedge clock); #1;
-      paddr   = addr;
-      pwrite  = 1'b0;
-      pstrb   = 4'b1111;
-      psel    = 1'b1;
-      penable = 1'b0;
-      @(posedge clock); #1;
-      penable = 1'b1;
-      while (!pready) @(posedge clock);
-      data    = prdata;
-      #1;
-      psel    = 1'b0;
-      penable = 1'b0;
-      pstrb   = 4'b0;
-    end
-  endtask
+  `include "apb_master.vh"
 
   // ---------------------------------------------------------------------------
   // Stimulus. 4 KByte write/read sweep using two patterns.

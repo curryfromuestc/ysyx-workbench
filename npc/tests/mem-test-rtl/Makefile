@@ -20,6 +20,8 @@ TOPDIR    := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 WB_DIR    := $(abspath $(TOPDIR)/../../..)
 PERIP_DIR := $(WB_DIR)/ysyxSoC/perip
 
+COMMON_INC := $(TOPDIR)/apb_master.vh
+
 PSRAM_SRCS := $(PERIP_DIR)/psram/psram_top_apb.v \
               $(PERIP_DIR)/psram/efabless/EF_PSRAM_CTRL_wb.v \
               $(PERIP_DIR)/psram/efabless/EF_PSRAM_CTRL.v \
@@ -37,6 +39,7 @@ BUILD_SDRAM := $(TOPDIR)/build/sdram
 VFLAGS := --binary --timing -j 1 \
           --timescale "1ns/1ps" \
           -CFLAGS "-O1 -std=c++20" \
+          +incdir+$(TOPDIR) \
           -Wno-fatal -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT \
           -Wno-CASEINCOMPLETE -Wno-LATCH -Wno-PINMISSING \
           -Wno-IMPLICIT -Wno-CASEX -Wno-WIDTHCONCAT \
@@ -51,14 +54,14 @@ PYTHON3 := $(shell command -v python3.12 || command -v python3.11 || command -v 
 
 all: psram sdram
 
-$(BUILD_PSRAM)/Vtb_psram: $(PSRAM_SRCS)
+$(BUILD_PSRAM)/Vtb_psram: $(PSRAM_SRCS) $(COMMON_INC)
 	@mkdir -p $(BUILD_PSRAM)
 	verilator $(VFLAGS) --top-module tb_psram \
 	  -Mdir $(BUILD_PSRAM) -o Vtb_psram \
 	  -MAKEFLAGS "PYTHON3=$(PYTHON3)" \
 	  $(PSRAM_SRCS)
 
-$(BUILD_SDRAM)/Vtb_sdram: $(SDRAM_SRCS)
+$(BUILD_SDRAM)/Vtb_sdram: $(SDRAM_SRCS) $(COMMON_INC)
 	@mkdir -p $(BUILD_SDRAM)
 	verilator $(VFLAGS) --top-module tb_sdram \
 	  -Mdir $(BUILD_SDRAM) -o Vtb_sdram \
