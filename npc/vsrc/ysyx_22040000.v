@@ -259,6 +259,10 @@ module ysyx_22040000(
 
   // ---- Bus outputs ----------------------------------------------------------
   // B4a: 在 IFU 通路里塞一个 icache. 直接映射, 16 块 x 4B = 64B, 触发器实现.
+  // B4b: 升级为 w-way set-associative + true-LRU. 默认 2-way x 8-set x 4B.
+  //   BLOCKS_LOG=4 (16 总块), WAYS_LOG=1 (2-way), OFFSET_LOG=2 (4B/块)
+  //   -> SETS = 2^(BLOCKS_LOG-WAYS_LOG) = 8, 容量 = 64 B.
+  //   修改 WAYS_LOG 即可切换 1-way/2-way/4-way 做对比 (BLOCKS_LOG 同步保持).
   // CPU FSM -> icache 上游 (req_valid / resp_valid 同协议)
   // icache 下游 -> 外部 SimpleBus 端口 io_ifu_* (协议不变)
   wire        ifu_cpu_req_valid  = (state == S_IF) & ~reset;
@@ -266,7 +270,7 @@ module ysyx_22040000(
   wire        ifu_cpu_resp_valid;
   wire [31:0] ifu_cpu_resp_data;
 
-  icache #(.BLOCKS_LOG(4), .OFFSET_LOG(2)) u_icache (
+  icache #(.BLOCKS_LOG(4), .WAYS_LOG(1), .OFFSET_LOG(2)) u_icache (
     .clock          (clock),
     .reset          (reset),
     .req_valid      (ifu_cpu_req_valid),

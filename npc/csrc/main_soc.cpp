@@ -173,17 +173,20 @@ int main(int argc, char **argv) {
   fprintf(stderr, "npc-soc: B2a access-fault events: %llu\n",
           (unsigned long long)fault_events);
 
-  // B4a: 退出前打印 icache 性能计数器 (verilator 通过 public_flat_rd 把它们
-  // 抬到 root scope 的扁平符号表里).
+  // B4a/B4b: 退出前打印 icache 性能计数器 (verilator 通过 public_flat_rd 把它们
+  // 抬到 root scope 的扁平符号表里). B4b 新增 cnt_victim (理论上 == cnt_miss,
+  // 作为 LRU 选 victim 的 sanity check).
   uint64_t ic_access = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_access;
   uint64_t ic_hit    = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_hit;
   uint64_t ic_miss   = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_miss;
+  uint64_t ic_victim = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_victim;
   double hit_rate = (ic_access == 0) ? 0.0 : (double)ic_hit * 100.0 / (double)ic_access;
-  fprintf(stderr, "npc-soc: icache access=%llu hit=%llu miss=%llu hit_rate=%.2f%%\n",
+  fprintf(stderr, "npc-soc: icache access=%llu hit=%llu miss=%llu hit_rate=%.2f%% victim=%llu\n",
           (unsigned long long)ic_access,
           (unsigned long long)ic_hit,
           (unsigned long long)ic_miss,
-          hit_rate);
+          hit_rate,
+          (unsigned long long)ic_victim);
 
   delete top;
   return 0;
