@@ -97,6 +97,15 @@ static void clock_pulse() {
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
 
+  // Long-running images (D6d litenes/Mario) emit ~2 KiB of UART traffic per
+  // frame separated by long quiet periods. Without unbuffered stdout the
+  // first frames disappear from the user's terminal until a few KiB of
+  // newlines accumulate, which makes "is anything happening?" debugging
+  // miserable. Disable buffering up front so $write("%c", ...) from the
+  // uart_tfifo model shows up immediately.
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
   const char *flash_path = default_flash_path;
   for (int i = 1; i < argc; ++i) {
     const char *a = argv[i];

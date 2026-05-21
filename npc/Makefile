@@ -114,6 +114,16 @@ SOC_VFLAGS     := --cc --exe --build --top-module $(SOC_TOP_MOD) \
 
 SOC_ARGS ?=
 
+# Convenience: `make sim-soc FLASH=path/to/foo.bin [MAX_CYCLES=...]` forwards
+# the args to npc-soc as `--flash=... --max-cycles=...`. SOC_ARGS still
+# works for callers that want full control of the CLI.
+ifneq ($(FLASH),)
+SOC_ARGS += --flash=$(FLASH)
+endif
+ifneq ($(MAX_CYCLES),)
+SOC_ARGS += --max-cycles=$(MAX_CYCLES)
+endif
+
 $(SOC_BIN): $(SOC_VSRCS) $(SOC_CSRCS)
 	$(call git_commit, "sim SoC RTL") # DO NOT REMOVE THIS LINE!!!
 	@mkdir -p $(BUILD_DIR)
