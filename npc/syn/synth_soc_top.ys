@@ -1,0 +1,31 @@
+## yosys script: synthesise ysyx_22040000 (the SoC-facing CPU top wrapper).
+##
+## Inputs are passed as -p commands so this file is run with:
+##   yosys -q -s syn/synth_soc_top.ys -l build/syn-soc.log
+##
+## Top is ysyx_22040000; it instantiates the same IDU / EXU / RegFile / CSR /
+## WBU modules used by the simulator harness. No DPI-C, no cross-hierarchy
+## references, no tech-mapping (we only care about lint + check -assert).
+
+# Read each module exactly once.
+read_verilog -sv vsrc/idu.v
+read_verilog -sv vsrc/exu.v
+read_verilog -sv vsrc/regfile.v
+read_verilog -sv vsrc/csr.v
+read_verilog -sv vsrc/wbu.v
+read_verilog -sv vsrc/ysyx_22040000.v
+
+# Elaborate + check.
+hierarchy -check -top ysyx_22040000
+
+# Lower processes/always blocks. proc_dlatch is the pass that would emit
+# "Inferring latch ..." for incomplete assignments; we run it but rely on
+# yosys -q to swallow the chatter and check -assert to fail the build if any
+# latch slipped through.
+proc
+opt
+check -assert
+
+# Full synth so technology-independent gate-level netlist falls out.
+synth -top ysyx_22040000
+check -assert

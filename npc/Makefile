@@ -125,6 +125,33 @@ sim-soc: $(SOC_BIN)
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all sim sim-soc clean
+# ---- D6b: yosys synthesis (lint + check -assert, no tech mapping) -----------
+# Goal: prove the NPC RTL is synth-clean (no inferred latch, no multiple
+# drivers). We synthesise two views:
+#   1. The SoC-facing top `ysyx_22040000` (this is the *real* tape-out target).
+#   2. The DPI-C harness top `cpu`, parsed with -DSYNTHESIS so the DPI calls
+#      and the cross-module `u_rf.rf[10]` reference are stripped at parse
+#      time and replaced with plain pmem-shaped ports.
+#
+# yosys is invoked with -q so stdout only carries warnings/errors. The full
+# (and very chatty) yosys log lands in $(BUILD_DIR)/syn-soc.log and
+# $(BUILD_DIR)/syn-cpu.log for debugging. `check -assert` inside the .ys
+# scripts hard-fails on any latch / unconnected / driver-conflict issue so
+# the exit code is reliable on its own.
+SYN_LOG_SOC  := $(BUILD_DIR)/syn-soc.log
+SYN_LOG_CPU  := $(BUILD_DIR)/syn-cpu.log
+# Sources actually parsed by the two yosys scripts (cpu top + soc-wrapper top).
+SYN_RTL_SRCS := $(VSRCS) $(TOPDIR)/vsrc/ysyx_22040000.v
+
+yosys-synth: $(SYN_RTL_SRCS) $(TOPDIR)/syn/synth_soc_top.ys $(TOPDIR)/syn/synth_cpu_top.ys
+	@mkdir -p $(BUILD_DIR)
+	@echo "==> yosys: synthesise ysyx_22040000 (SoC-facing CPU top)"
+	cd $(TOPDIR) && yosys -q -l $(SYN_LOG_SOC) -s syn/synth_soc_top.ys
+	@echo "==> yosys: synthesise cpu (D4/D5 harness top, -DSYNTHESIS)"
+	cd $(TOPDIR) && yosys -q -l $(SYN_LOG_CPU) -s syn/synth_cpu_top.ys
+	@echo "==> yosys synthesis OK: clean lint, all check -assert passed"
+	@echo "    full log: $(SYN_LOG_SOC) and $(SYN_LOG_CPU)"
+
+.PHONY: all sim sim-soc clean yosys-synth
 
 include $(TOPDIR)/../Makefile

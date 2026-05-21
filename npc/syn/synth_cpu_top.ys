@@ -1,0 +1,29 @@
+## yosys script: synthesise cpu (D4/D5 DPI-C harness) under SYNTHESIS macro.
+##
+## The simulator harness uses DPI-C (pmem_read/pmem_write/npc_trap). Those
+## constructs are wrapped in `ifdef SYNTHESIS so they only exist for the
+## simulator. Here we define SYNTHESIS at parse time; the modules then expose
+## plain bus-shaped ports instead, which yosys can elaborate normally.
+##
+## Run with:
+##   yosys -q -s syn/synth_cpu_top.ys -l build/syn-cpu.log
+
+verilog_defines -DSYNTHESIS
+
+read_verilog -sv vsrc/regfile.v
+read_verilog -sv vsrc/csr.v
+read_verilog -sv vsrc/exu.v
+read_verilog -sv vsrc/idu.v
+read_verilog -sv vsrc/wbu.v
+read_verilog -sv vsrc/ifu.v
+read_verilog -sv vsrc/lsu.v
+read_verilog -sv vsrc/cpu.v
+
+hierarchy -check -top cpu
+
+proc
+opt
+check -assert
+
+synth -top cpu
+check -assert

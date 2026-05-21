@@ -14,6 +14,22 @@
 module cpu(
   input clk,
   input rst
+`ifdef SYNTHESIS
+  ,
+  // IFU bus (replaces DPI-C pmem_read in IFU)
+  output [31:0] ifu_pmem_raddr,
+  input  [31:0] ifu_pmem_rdata,
+  // LSU bus (replaces DPI-C pmem_read/pmem_write in LSU)
+  output [31:0] lsu_pmem_raddr,
+  input  [31:0] lsu_pmem_rdata,
+  output        lsu_pmem_wen,
+  output [31:0] lsu_pmem_waddr,
+  output [31:0] lsu_pmem_wdata,
+  output [7:0]  lsu_pmem_wmask,
+  // ebreak status (replaces DPI-C npc_trap in cpu.v)
+  output        npc_ebreak,
+  output [31:0] npc_a0
+`endif
 );
   reg  [31:0] pc;
   wire [31:0] pc_next;
@@ -51,7 +67,11 @@ module cpu(
     else     pc <= pc_next;
   end
 
-  IFU u_ifu (.pc(pc), .inst(inst));
+  IFU u_ifu (.pc(pc), .inst(inst)
+`ifdef SYNTHESIS
+    , .pmem_raddr(ifu_pmem_raddr), .pmem_rdata(ifu_pmem_rdata)
+`endif
+  );
 
   IDU u_idu (
     .inst(inst),
@@ -83,6 +103,11 @@ module cpu(
     .mem_re(mem_re & ~rst), .mem_we(mem_we & ~rst),
     .funct3(funct3),
     .load_data(load_data)
+`ifdef SYNTHESIS
+    , .pmem_raddr(lsu_pmem_raddr), .pmem_rdata(lsu_pmem_rdata),
+    .pmem_wen(lsu_pmem_wen), .pmem_waddr(lsu_pmem_waddr),
+    .pmem_wdata(lsu_pmem_wdata), .pmem_wmask(lsu_pmem_wmask)
+`endif
   );
 
   // ---- CSR ------------------------------------------------------------------
@@ -108,11 +133,45 @@ module cpu(
     .pc_next(pc_next), .wb_data(wb_data)
   );
 
-  // ebreak hookup: synchronously notify simulator. a0 = x10 (regfile index 10).
+  // ebreak hookup: synchronously notify the host.
+  //   - in simulation: call DPI-C npc_trap so the harness terminates the run.
+  //   - in synthesis : expose `npc_ebreak` (level) and `npc_a0` (x10) as ports
+  //     so the outer hierarchy can observe them without cross-module references.
+`ifdef SYNTHESIS
+  // Mirror x10 onto a port so we don't need a cross-hierarchy reference into
+  // u_rf.rf[10] (which yosys cannot resolve).
+  RegFile_PORT_X10 u_rf_x10 (
+    .clk(clk),
+    .wen(reg_wen & ~rst & ~is_ebreak),
+    .waddr(rd), .wdata(wb_data),
+    .x10(npc_a0)
+  );
+  assign npc_ebreak = is_ebreak & ~rst;
+`else
   import "DPI-C" function void npc_trap(input int code);
   always @(posedge clk) begin
     if (!rst && is_ebreak) begin
       npc_trap(u_rf.rf[10]);
     end
   end
+`endif
 endmodule
+
+`ifdef SYNTHESIS
+// Tiny shadow of regfile x10 used purely so the top-level can expose `a0` as
+// a port for synthesis without poking into the regfile internals. It snapshots
+// the writeback bus when (waddr == 10), so it always tracks x10.
+module RegFile_PORT_X10(
+  input         clk,
+  input         wen,
+  input  [3:0]  waddr,
+  input  [31:0] wdata,
+  output [31:0] x10
+);
+  reg [31:0] x10_r;
+  always @(posedge clk) begin
+    if (wen && waddr == 4'd10) x10_r <= wdata;
+  end
+  assign x10 = x10_r;
+endmodule
+`endif
