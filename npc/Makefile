@@ -1,8 +1,11 @@
 # NPC: minirv single-cycle CPU, verilated.
 #
 # Targets:
-#   sim     verilate + compile -> build/npc; run with ARGS=... (or default img)
-#   clean   wipe build/
+#   sim       verilate + compile the D4/D5 DPI harness (top=cpu)
+#             -> build/npc; run with ARGS=... (or default img)
+#   sim-soc   verilate + compile the D6 ysyxSoC harness (top=ysyxSoCFull)
+#             -> build/npc-soc; run with SOC_ARGS=... (defaults to a few k cycles)
+#   clean     wipe build/
 
 TOPDIR    := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BUILD_DIR := $(TOPDIR)/build
@@ -12,11 +15,21 @@ BUILD_DIR := $(TOPDIR)/build
 # default to the sibling nemu directory in the workbench tree.
 NEMU_HOME ?= $(abspath $(TOPDIR)/../nemu)
 export NEMU_HOME
+
+# ---- D4/D5 (DPI-C) harness --------------------------------------------------
 OBJ_DIR   := $(BUILD_DIR)/obj_dir
 BIN       := $(BUILD_DIR)/npc
 
-VSRCS     := $(wildcard $(TOPDIR)/vsrc/*.v)
-CSRCS     := $(wildcard $(TOPDIR)/csrc/*.cpp)
+# Only the cpu-side RTL (no SoC top, no SoC wrapper).
+VSRCS     := $(TOPDIR)/vsrc/cpu.v \
+             $(TOPDIR)/vsrc/csr.v \
+             $(TOPDIR)/vsrc/exu.v \
+             $(TOPDIR)/vsrc/idu.v \
+             $(TOPDIR)/vsrc/ifu.v \
+             $(TOPDIR)/vsrc/lsu.v \
+             $(TOPDIR)/vsrc/regfile.v \
+             $(TOPDIR)/vsrc/wbu.v
+CSRCS     := $(TOPDIR)/csrc/main.cpp
 TOP_MOD   := cpu
 
 VFLAGS    := --cc --exe --build --top-module $(TOP_MOD) \
@@ -54,9 +67,64 @@ sim: $(BIN) $(DEFAULT_IMG)
 	  echo "==> $(BIN) --image=$(DEFAULT_IMG)"; $(BIN) --image=$(DEFAULT_IMG); \
 	fi
 
+# ---- D6 ysyxSoC harness -----------------------------------------------------
+SOC_DIR        := $(TOPDIR)/vsrc-soc
+SOC_OBJ_DIR    := $(BUILD_DIR)/obj_dir_soc
+SOC_BIN        := $(BUILD_DIR)/npc-soc
+YSYXSOC_DIR    := $(abspath $(TOPDIR)/../ysyxSoC)
+
+# CPU side: same modules used by `sim`, plus the SoC-compatible top wrapper.
+SOC_CPU_VSRCS  := $(TOPDIR)/vsrc/csr.v \
+                  $(TOPDIR)/vsrc/exu.v \
+                  $(TOPDIR)/vsrc/idu.v \
+                  $(TOPDIR)/vsrc/regfile.v \
+                  $(TOPDIR)/vsrc/wbu.v \
+                  $(TOPDIR)/vsrc/ysyx_22040000.v
+
+# ysyxSoCFull (patched copy: module name `ysyx_00000000` -> `ysyx_22040000`).
+SOC_TOP_V      := $(SOC_DIR)/ysyxSoCFull.v
+
+# All peripheral .v files shipped with ysyxSoC.
+SOC_PERIP_V    := $(shell find $(YSYXSOC_DIR)/perip -name '*.v' -type f)
+
+SOC_VSRCS      := $(SOC_CPU_VSRCS) $(SOC_TOP_V) $(SOC_PERIP_V)
+SOC_CSRCS      := $(TOPDIR)/csrc/main_soc.cpp
+SOC_TOP_MOD    := ysyxSoCFull
+
+# verilator needs to know where to find `uart_defines.v` / `spi_defines.v`
+# which are `include`d by their siblings.
+SOC_INCDIRS    := +incdir+$(YSYXSOC_DIR)/perip/uart16550/rtl \
+                  +incdir+$(YSYXSOC_DIR)/perip/spi/rtl
+
+# Notes on flags:
+#   --timescale "1ns/1ns"  : required because peripheral .v files use `timescale
+#   --no-timing            : disable SV timing constructs (delays etc.)
+#   -Wno-* (extensive)     : the vendor RTL trips many lint rules we cannot fix.
+SOC_VFLAGS     := --cc --exe --build --top-module $(SOC_TOP_MOD) \
+                  --timescale "1ns/1ns" --no-timing \
+                  -Wno-fatal -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT \
+                  -Wno-CASEINCOMPLETE -Wno-LATCH -Wno-PINMISSING \
+                  -Wno-IMPLICIT -Wno-CASEX -Wno-WIDTHCONCAT \
+                  -Wno-MULTIDRIVEN -Wno-INITIALDLY -Wno-MULTITOP \
+                  -Wno-COMBDLY -Wno-STMTDLY -Wno-SELRANGE \
+                  -Wno-ASCRANGE -Wno-EOFNEWLINE -Wno-BLKANDNBLK \
+                  $(SOC_INCDIRS) \
+                  -Mdir $(SOC_OBJ_DIR) -o $(SOC_BIN) \
+                  -CFLAGS "-O1 -std=c++17" -LDFLAGS "-ldl"
+
+SOC_ARGS ?=
+
+$(SOC_BIN): $(SOC_VSRCS) $(SOC_CSRCS)
+	$(call git_commit, "sim SoC RTL") # DO NOT REMOVE THIS LINE!!!
+	@mkdir -p $(BUILD_DIR)
+	verilator $(SOC_VFLAGS) -MAKEFLAGS "PYTHON3=$(PYTHON3)" $(SOC_VSRCS) $(SOC_CSRCS)
+
+sim-soc: $(SOC_BIN)
+	@echo "==> $(SOC_BIN) $(SOC_ARGS)"; $(SOC_BIN) $(SOC_ARGS)
+
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all sim clean
+.PHONY: all sim sim-soc clean
 
 include $(TOPDIR)/../Makefile
