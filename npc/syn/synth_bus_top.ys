@@ -1,0 +1,24 @@
+## yosys script: synthesise ysyx_22040000_bus (the B1 full-handshake CPU top).
+##
+## Run with:
+##   yosys -q -s syn/synth_bus_top.ys -l build/syn-bus.log
+##
+## Same shared submodules as the SoC-facing top (IDU/EXU/RegFile/CSR/WBU),
+## but the outer FSM has 6 states (S_IF_REQ..S_WB) and drives the full
+## handshake on both IFU and LSU master ports. This script is here to
+## prove the new top is latch-free / driver-conflict-free.
+
+read_verilog -sv vsrc/idu.v
+read_verilog -sv vsrc/exu.v
+read_verilog -sv vsrc/regfile.v
+read_verilog -sv vsrc/csr.v
+read_verilog -sv vsrc/wbu.v
+read_verilog -sv vsrc/ysyx_22040000_bus.v
+
+hierarchy -check -top ysyx_22040000_bus
+proc
+opt
+check -assert
+
+synth -top ysyx_22040000_bus
+check -assert

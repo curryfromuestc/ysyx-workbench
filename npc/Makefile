@@ -153,6 +153,70 @@ $(SOC_BIN): $(SOC_VSRCS) $(SOC_CSRCS)
 sim-soc: $(SOC_BIN)
 	@echo "==> $(SOC_BIN) $(SOC_ARGS)"; $(SOC_BIN) $(SOC_ARGS)
 
+# ---- B1: full-handshake SimpleBus harness -----------------------------------
+# Independent from `sim` (DPI-C, top=cpu) and `sim-soc` (ysyxSoC, top=
+# ysyxSoCFull). Uses a new RTL top `ysyx_22040000_bus` whose IFU/LSU master
+# interfaces speak the FULL handshake (reqValid/reqReady + respValid/
+# respReady). The host harness in csrc/main_bus.cpp implements a slave-side
+# memory model that injects random delays in both phases.
+BUS_OBJ_DIR := $(BUILD_DIR)/obj_dir_bus
+BUS_BIN     := $(BUILD_DIR)/npc-bus
+BUS_VSRCS   := $(TOPDIR)/vsrc/csr.v \
+               $(TOPDIR)/vsrc/exu.v \
+               $(TOPDIR)/vsrc/idu.v \
+               $(TOPDIR)/vsrc/regfile.v \
+               $(TOPDIR)/vsrc/wbu.v \
+               $(TOPDIR)/vsrc/ysyx_22040000_bus.v
+BUS_CSRCS   := $(TOPDIR)/csrc/main_bus.cpp
+BUS_TOP_MOD := ysyx_22040000_bus
+
+BUS_VFLAGS  := --cc --exe --build --top-module $(BUS_TOP_MOD) \
+               -Wno-fatal -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT \
+               -Mdir $(BUS_OBJ_DIR) -o $(BUS_BIN) \
+               -CFLAGS "-O2 -std=c++17" -LDFLAGS "-ldl"
+
+BUS_ARGS ?=
+
+$(BUS_BIN): $(BUS_VSRCS) $(BUS_CSRCS)
+	@mkdir -p $(BUILD_DIR)
+	verilator $(BUS_VFLAGS) -MAKEFLAGS "PYTHON3=$(PYTHON3)" $(BUS_VSRCS) $(BUS_CSRCS)
+
+sim-bus: $(BUS_BIN) $(DEFAULT_IMG)
+	@if [ -n "$(BUS_ARGS)" ]; then \
+	  echo "==> $(BUS_BIN) $(BUS_ARGS)"; $(BUS_BIN) $(BUS_ARGS); \
+	else \
+	  echo "==> $(BUS_BIN) --image=$(DEFAULT_IMG)"; $(BUS_BIN) --image=$(DEFAULT_IMG); \
+	fi
+
+# Sweep a fixed set of cpu-tests under several random seeds + delay profiles.
+# Listed binaries are the riscv32e-npc (full RV32E) flavour built by the
+# am-kernels cpu-tests target; they all end with `ebreak; a0=0` on success.
+BUS_TESTS_DIR := $(abspath $(TOPDIR)/../am-kernels/tests/cpu-tests/build)
+BUS_TESTS     := dummy add bubble-sort recursion fib
+BUS_PROFILES  := "--req-min=1 --req-max=1 --resp-min=0 --resp-max=0" \
+                 "--req-min=1 --req-max=3 --resp-min=0 --resp-max=3" \
+                 "--req-min=2 --req-max=8 --resp-min=2 --resp-max=10"
+
+bus-tests: $(BUS_BIN)
+	@set -e; pass=0; fail=0; \
+	for t in $(BUS_TESTS); do \
+	  img=$(BUS_TESTS_DIR)/$$t-riscv32e-npc.bin; \
+	  if [ ! -f $$img ]; then echo "  SKIP $$t (missing $$img)"; continue; fi; \
+	  for seed in 0xdead1 0xbeef2 0xcafe3; do \
+	    for prof in $(BUS_PROFILES); do \
+	      printf "  %-14s seed=%s prof=%s ... " "$$t" "$$seed" "$$prof"; \
+	      out=$$($(BUS_BIN) --image=$$img --seed=$$seed $$prof --max-cycles=2000000 2>/dev/null); \
+	      if echo "$$out" | grep -q "HIT GOOD TRAP"; then \
+	        echo "PASS"; pass=$$((pass+1)); \
+	      else \
+	        echo "FAIL ($$out)"; fail=$$((fail+1)); \
+	      fi; \
+	    done; \
+	  done; \
+	done; \
+	echo "==> bus-tests done: pass=$$pass fail=$$fail"; \
+	test $$fail -eq 0
+
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -171,18 +235,22 @@ clean:
 # the exit code is reliable on its own.
 SYN_LOG_SOC  := $(BUILD_DIR)/syn-soc.log
 SYN_LOG_CPU  := $(BUILD_DIR)/syn-cpu.log
-# Sources actually parsed by the two yosys scripts (cpu top + soc-wrapper top).
-SYN_RTL_SRCS := $(VSRCS) $(TOPDIR)/vsrc/ysyx_22040000.v
+SYN_LOG_BUS  := $(BUILD_DIR)/syn-bus.log
+# Sources actually parsed by the three yosys scripts (cpu top + soc-wrapper
+# top + bus-handshake top).
+SYN_RTL_SRCS := $(VSRCS) $(TOPDIR)/vsrc/ysyx_22040000.v $(TOPDIR)/vsrc/ysyx_22040000_bus.v
 
-yosys-synth: $(SYN_RTL_SRCS) $(TOPDIR)/syn/synth_soc_top.ys $(TOPDIR)/syn/synth_cpu_top.ys
+yosys-synth: $(SYN_RTL_SRCS) $(TOPDIR)/syn/synth_soc_top.ys $(TOPDIR)/syn/synth_cpu_top.ys $(TOPDIR)/syn/synth_bus_top.ys
 	@mkdir -p $(BUILD_DIR)
 	@echo "==> yosys: synthesise ysyx_22040000 (SoC-facing CPU top)"
 	cd $(TOPDIR) && yosys -q -l $(SYN_LOG_SOC) -s syn/synth_soc_top.ys
 	@echo "==> yosys: synthesise cpu (D4/D5 harness top, -DSYNTHESIS)"
 	cd $(TOPDIR) && yosys -q -l $(SYN_LOG_CPU) -s syn/synth_cpu_top.ys
+	@echo "==> yosys: synthesise ysyx_22040000_bus (B1 full-handshake top)"
+	cd $(TOPDIR) && yosys -q -l $(SYN_LOG_BUS) -s syn/synth_bus_top.ys
 	@echo "==> yosys synthesis OK: clean lint, all check -assert passed"
-	@echo "    full log: $(SYN_LOG_SOC) and $(SYN_LOG_CPU)"
+	@echo "    full log: $(SYN_LOG_SOC), $(SYN_LOG_CPU), $(SYN_LOG_BUS)"
 
-.PHONY: all sim sim-soc sim-trace clean yosys-synth
+.PHONY: all sim sim-soc sim-trace sim-bus bus-tests clean yosys-synth
 
 include $(TOPDIR)/../Makefile
