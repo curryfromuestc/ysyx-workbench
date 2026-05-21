@@ -126,9 +126,10 @@ int main(int argc, char **argv) {
           (unsigned long long)cycle_cnt);
   fflush(stderr);
 
-  // ysyx_22040000.v parks the FSM in S_EX on ebreak (no exception support
-  // yet), so we detect it host-side: if inst_r decodes to ebreak (0x00100073)
-  // and state == S_EX (== 1) we emit HIT GOOD/BAD TRAP using a0 and stop.
+  // B5a: NPC 现在是 5 段流水线 (ysyx_22040000.v). 没有多周期 FSM 的 state
+  // 信号了; 改用 ebreak_park sticky bit: WB 段一旦看到 ebreak, ebreak_park
+  // 拉高并锁住整条流水线. host 检测 ebreak_park=1 即可稳定捕获 ebreak.
+  // 同时把 mem_wb_inst 当作 inst_r 的对应物用于 sanity check (= 0x00100073).
   auto *r = top->rootp;
   bool trap_hit = false;
   int  trap_code = 0;
@@ -139,13 +140,55 @@ int main(int argc, char **argv) {
   // tracking it here makes the metric available the moment a future
   // microbench (B2c) or out-of-range probe trips one.
   uint64_t fault_events = 0;
+  const char *pc_trace_env = getenv("PC_TRACE_EVERY");
+  uint64_t pc_trace_every = pc_trace_env ? strtoull(pc_trace_env, nullptr, 0) : 0;
+  const char *jalr_dump_env = getenv("JALR_DUMP");
+  bool jalr_dump = jalr_dump_env && *jalr_dump_env == '1';
+  int jalr_dumps_left = 20;
   while (!Verilated::gotFinish() && cycle_cnt < max_cycles) {
     clock_pulse();
     if (r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__any_fault) {
       ++fault_events;
     }
-    if (r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__state == 1 &&
-        r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__inst_r == 0x00100073u) {
+    if (jalr_dump && jalr_dumps_left > 0) {
+      uint32_t id_ex_is_jalr = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__id_ex_is_jalr;
+      uint32_t id_ex_valid   = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__id_ex_valid;
+      if (id_ex_is_jalr && id_ex_valid) {
+        uint32_t id_ex_pc   = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__id_ex_pc;
+        uint32_t id_ex_rs1  = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__id_ex_rs1_val;
+        uint32_t id_ex_imm  = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__id_ex_imm;
+        uint32_t id_ex_rd   = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__id_ex_rd;
+        uint32_t ifid_pc    = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__if_id_pc;
+        uint32_t ifid_inst  = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__if_id_inst;
+        uint32_t ra_now     = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_rf__DOT__rf[1];
+        fprintf(stderr, "[JALR_EX] cyc=%llu id_ex_pc=%08x rs1_val=%08x imm=%08x rd=%u ifid_pc=%08x ifid_inst=%08x rf_ra=%08x\n",
+                (unsigned long long)cycle_cnt, id_ex_pc, id_ex_rs1, id_ex_imm, id_ex_rd, ifid_pc, ifid_inst, ra_now);
+        --jalr_dumps_left;
+      }
+    }
+    if (pc_trace_every && (cycle_cnt % pc_trace_every) == 0) {
+      uint32_t pc       = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__pc;
+      uint32_t wb_pc    = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__mem_wb_pc;
+      uint32_t wb_valid = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__mem_wb_valid;
+      uint32_t pf       = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__pipe_freeze;
+      uint32_t hz       = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__id_hazard;
+      uint32_t irv      = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__ifu_cpu_resp_valid;
+      uint32_t exv      = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__ex_mem_valid;
+      uint32_t exre     = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__ex_mem_mem_re;
+      uint32_t exwe     = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__ex_mem_mem_we;
+      uint32_t lrv      = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__io_lsu_respValid;
+      uint64_t ica = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_access;
+      uint64_t ich = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_hit;
+      uint64_t icm = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__cnt_miss;
+      uint32_t icst = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_icache__DOT__state;
+      uint32_t brv  = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT___bridge_io_ifu_respValid;
+      uint32_t bsi  = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__bridge__DOT__stateI;
+      uint32_t bsd  = r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__bridge__DOT__stateD;
+      fprintf(stderr, "[PC] cyc=%llu pc=%08x wb_v=%u wb_pc=%08x | pf=%u hz=%u irv=%u | exv=%u exre=%u exwe=%u lrv=%u | icA=%llu icH=%llu icM=%llu icST=%u brv=%u bsI=%u bsD=%u\n",
+              (unsigned long long)cycle_cnt, pc, wb_valid, wb_pc, pf, hz, irv, exv, exre, exwe, lrv,
+              (unsigned long long)ica, (unsigned long long)ich, (unsigned long long)icm, icst, brv, bsi, bsd);
+    }
+    if (r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__ebreak_park) {
       trap_hit  = true;
       // a0 is x10. With ABI=ilp32e RV32E the regfile has 16 entries; a0 is rf[10].
       trap_code = (int)r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__u_rf__DOT__rf[10];

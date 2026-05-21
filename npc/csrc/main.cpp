@@ -13,8 +13,19 @@
 #include <dlfcn.h>
 #include <sys/time.h>
 #include <verilated.h>
+#ifdef PIPELINE
+#include "Vcpu_pipeline.h"
+#include "Vcpu_pipeline___024root.h"
+typedef Vcpu_pipeline VTop;
+#define TOP_ROOT(field) (top->rootp->cpu_pipeline__DOT__u_cpu_top__DOT__ ## field)
+#define TOP_RF(i)       (top->rootp->cpu_pipeline__DOT__u_cpu_top__DOT__u_rf__DOT__rf[(i)])
+#else
 #include "Vcpu.h"
 #include "Vcpu___024root.h"
+typedef Vcpu VTop;
+#define TOP_ROOT(field) (top->rootp->cpu__DOT__ ## field)
+#define TOP_RF(i)       (top->rootp->cpu__DOT__u_rf__DOT__rf[(i)])
+#endif
 #ifdef VCD_TRACE
 #include <verilated_vcd_c.h>
 #endif
@@ -38,7 +49,7 @@
 #define RTC_ADDR_HI       0xa000004cu
 
 static uint8_t  *pmem  = nullptr;
-static Vcpu     *top   = nullptr;
+static VTop     *top   = nullptr;
 static bool      trap_hit   = false;
 static int       trap_code  = -1;
 static uint64_t  max_cycles = 1000000000ull;
@@ -223,14 +234,46 @@ static ref_init_fn     ref_init   = nullptr;
 // have already swung to the NEXT (post-PC-update) instruction.
 static bool            diff_was_mmio_this_cycle = false;
 
+#ifdef PIPELINE
+// In the pipeline, the MEM/WB register seen before the posedge is the
+// instruction that writes the RegFile on that posedge. After the posedge,
+// mem_wb_* already holds the next instruction, while rf[] has just received the
+// previous one. Difftest therefore compares rf[] after the edge against retire
+// metadata sampled before the edge.
+static bool     diff_retire_valid_this_cycle = false;
+static bool     diff_retire_is_ebreak_this_cycle = false;
+static uint32_t diff_retire_next_pc_this_cycle = PMEM_BASE;
+static uint32_t diff_retire_pc_this_cycle = 0;
+static uint32_t diff_retire_rd_this_cycle = 0;
+static uint32_t diff_retire_reg_wen_this_cycle = 0;
+static uint32_t diff_retire_alu_result_this_cycle = 0;
+static uint32_t diff_retire_wb_sel_this_cycle = 0;
+static bool     diff_mmio_pending_for_retire = false;
+#endif
+
 enum { DIFF_TO_DUT = 0, DIFF_TO_REF = 1 };
 
 // Pull RTL state straight out of the Verilator-generated root. Path names
 // here mirror what verilator emits for `cpu.u_rf.rf` etc. — they will drift
 // if the RTL module hierarchy changes, in which case grep them out of
 // build/obj_dir/Vcpu___024root.h again.
-static inline uint32_t rtl_pc()                  { return top->rootp->cpu__DOT__pc; }
-static inline uint32_t rtl_gpr(int i)            { return top->rootp->cpu__DOT__u_rf__DOT__rf[i]; }
+//
+// B5b PIPELINE=1 path: retire happens in MEM/WB stage, so PC + GPR snapshots
+// must come from mem_wb_pc (not the IF-stage pc reg, which is several cycles
+// ahead). MMIO predicate keys off the EX/MEM stage (ex_mem_*).
+#ifdef PIPELINE
+static inline uint32_t rtl_pc()       { return diff_retire_next_pc_this_cycle; }
+static inline bool     rtl_retire()   {
+  return diff_retire_valid_this_cycle && !diff_retire_is_ebreak_this_cycle;
+}
+static inline uint32_t rtl_lsu_addr() { return TOP_ROOT(ex_mem_alu_result); }
+static inline bool     rtl_lsu_active() {
+  return TOP_ROOT(ex_mem_valid) &&
+        (TOP_ROOT(ex_mem_mem_re) || TOP_ROOT(ex_mem_mem_we));
+}
+#else
+static inline uint32_t rtl_pc()                  { return TOP_ROOT(pc); }
+static inline bool     rtl_retire()              { return true; }
 static inline uint32_t rtl_lsu_addr() {
 #ifdef VCD_TRACE
   return 0;  // not used in trace mode (difftest disabled)
@@ -248,11 +291,42 @@ static inline bool     rtl_lsu_active() {
       || top->rootp->cpu__DOT____Vcellinp__u_lsu__mem_we;
 #endif
 }
+#endif
+static inline uint32_t rtl_gpr(int i)            { return TOP_RF(i); }
+
+#ifdef PIPELINE
+static void sample_pipeline_retire_preedge() {
+  // 用 wb_advanced 而非 mem_wb_valid: pipe_freeze (mem_stall / ebreak_park)
+  // 期间 mem_wb_valid 保持高但没有新指令进 MEM/WB, 不应再 step REF.
+  diff_retire_valid_this_cycle      = TOP_ROOT(wb_advanced);
+  diff_retire_is_ebreak_this_cycle  = TOP_ROOT(mem_wb_is_ebreak);
+  diff_retire_next_pc_this_cycle    = TOP_ROOT(mem_wb_target_pc);
+  diff_retire_pc_this_cycle         = TOP_ROOT(mem_wb_pc);
+  diff_retire_rd_this_cycle         = TOP_ROOT(mem_wb_rd);
+  diff_retire_reg_wen_this_cycle    = TOP_ROOT(mem_wb_reg_wen);
+  diff_retire_alu_result_this_cycle = TOP_ROOT(mem_wb_alu_result);
+  diff_retire_wb_sel_this_cycle     = TOP_ROOT(mem_wb_wb_sel);
+  diff_was_mmio_this_cycle          = diff_mmio_pending_for_retire;
+}
+#endif
 
 static void snapshot_dut(NpcRegState *s) {
   for (int i = 0; i < 16; ++i) s->gpr[i] = rtl_gpr(i);
   s->pc      = rtl_pc();
   s->mstatus = 0;            // CSR not modelled in NPC RV32E for now
+  s->mtvec   = 0;
+  s->mepc    = 0;
+  s->mcause  = 0;
+}
+
+// PIPELINE=1: just after reset the pipeline hasn't retired any instruction,
+// so mem_wb_pc is still zero. REF must be initialised to PC=PMEM_BASE so its
+// first ref_exec(1) fetches at the same address NPC's IF stage does. This
+// helper builds the synthetic init state for diff_sync_from_dut.
+static void synth_init_state(NpcRegState *s) {
+  for (int i = 0; i < 16; ++i) s->gpr[i] = 0;
+  s->pc      = PMEM_BASE;
+  s->mstatus = 0;
   s->mtvec   = 0;
   s->mepc    = 0;
   s->mcause  = 0;
@@ -298,7 +372,14 @@ static void diff_sync_from_dut(size_t img_size) {
     ref_memcpy(PMEM_BASE, pmem, img_size, DIFF_TO_REF);
   }
   NpcRegState st;
+#ifdef PIPELINE
+  // Pipeline NPC hasn't retired anything yet; mem_wb_pc==0. Hand REF an
+  // explicit "fresh from reset" snapshot at PC=PMEM_BASE so it starts from
+  // the same instruction the IF stage will fetch first.
+  synth_init_state(&st);
+#else
   snapshot_dut(&st);
+#endif
   ref_regcpy(&st, DIFF_TO_REF);
 }
 
@@ -350,6 +431,14 @@ static void diff_step_and_check() {
   if (bad) {
     fprintf(stderr, "DIFFTEST: failed (first mismatch at cycle %llu, dut pc=0x%08x)\n",
             (unsigned long long)cycle_cnt, dut_pc);
+#ifdef PIPELINE
+    fprintf(stderr, "DIFFTEST: dut retire pc=0x%08x rd=%u reg_wen=%u alu_result=0x%08x wb_sel=%u\n",
+            diff_retire_pc_this_cycle, diff_retire_rd_this_cycle,
+            diff_retire_reg_wen_this_cycle, diff_retire_alu_result_this_cycle,
+            diff_retire_wb_sel_this_cycle);
+    fprintf(stderr, "DIFFTEST: RF[1]=0x%08x RF[2]=0x%08x RF[8]=0x%08x RF[10]=0x%08x\n",
+            TOP_RF(1), TOP_RF(2), TOP_RF(8), TOP_RF(10));
+#endif
     // Force loop exit. We reuse trap_hit so the "DIFFTEST: failed" print at
     // the end of main() also lands.
     trap_hit  = true;
@@ -373,10 +462,23 @@ static void clock_pulse() {
 #ifdef VCD_TRACE
   if (tfp) { tfp->dump(vcd_time); vcd_time++; }
 #endif
+#ifdef PIPELINE
+  if (top->rst) {
+    diff_retire_valid_this_cycle = false;
+    diff_retire_is_ebreak_this_cycle = false;
+    diff_was_mmio_this_cycle = false;
+    diff_mmio_pending_for_retire = false;
+  } else {
+    sample_pipeline_retire_preedge();
+    uint32_t a = rtl_lsu_addr();
+    diff_mmio_pending_for_retire = rtl_lsu_active() && addr_is_mmio(a);
+  }
+#else
   if (diff_enabled && !top->rst) {
     uint32_t a = rtl_lsu_addr();
     diff_was_mmio_this_cycle = rtl_lsu_active() && addr_is_mmio(a);
   }
+#endif
   top->clk = 1;
   top->eval();
 #ifdef VCD_TRACE
@@ -422,7 +524,7 @@ int main(int argc, char **argv) {
 
   diff_init_so(diff_so);
 
-  top = new Vcpu;
+  top = new VTop;
 #ifdef VCD_TRACE
   if (tfp) { top->trace(tfp, 99); tfp->open(trace_path); }
 #endif
@@ -439,7 +541,11 @@ int main(int argc, char **argv) {
 
   while (!Verilated::gotFinish() && !trap_hit && cycle_cnt < max_cycles) {
     clock_pulse();
-    diff_step_and_check();
+    // PIPELINE=1: only step REF on a retire cycle. The single-cycle CPU retires
+    // every cycle, so rtl_retire() returns true always.
+    if (rtl_retire()) {
+      diff_step_and_check();
+    }
   }
 
   int rc;

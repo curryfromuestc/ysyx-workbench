@@ -20,7 +20,23 @@ export NEMU_HOME
 OBJ_DIR   := $(BUILD_DIR)/obj_dir
 BIN       := $(BUILD_DIR)/npc
 
+# B5b: PIPELINE=1 swaps the single-cycle cpu.v top for cpu_pipeline.v, which
+# wraps ysyx_22040000 (the 5-stage pipeline SoC top) with a SimpleBus ->
+# DPI-pmem bridge so the same `make sim` harness can drive the pipeline.
+PIPELINE ?= 0
+
 # Only the cpu-side RTL (no SoC top, no SoC wrapper).
+ifeq ($(PIPELINE),1)
+VSRCS     := $(TOPDIR)/vsrc/cpu_pipeline.v \
+             $(TOPDIR)/vsrc/ysyx_22040000.v \
+             $(TOPDIR)/vsrc/csr.v \
+             $(TOPDIR)/vsrc/exu.v \
+             $(TOPDIR)/vsrc/idu.v \
+             $(TOPDIR)/vsrc/regfile.v
+TOP_MOD   := cpu_pipeline
+PIPELINE_CFLAGS := -DPIPELINE
+PIPELINE_VFLAGS := -DPIPELINE
+else
 VSRCS     := $(TOPDIR)/vsrc/cpu.v \
              $(TOPDIR)/vsrc/csr.v \
              $(TOPDIR)/vsrc/exu.v \
@@ -29,13 +45,17 @@ VSRCS     := $(TOPDIR)/vsrc/cpu.v \
              $(TOPDIR)/vsrc/lsu.v \
              $(TOPDIR)/vsrc/regfile.v \
              $(TOPDIR)/vsrc/wbu.v
-CSRCS     := $(TOPDIR)/csrc/main.cpp
 TOP_MOD   := cpu
+PIPELINE_CFLAGS :=
+PIPELINE_VFLAGS :=
+endif
+CSRCS     := $(TOPDIR)/csrc/main.cpp
 
 VFLAGS    := --cc --exe --build --top-module $(TOP_MOD) \
              -Wno-fatal -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT \
+             $(PIPELINE_VFLAGS) \
              -Mdir $(OBJ_DIR) -o $(BIN) \
-             -CFLAGS "-O2 -std=c++17" -LDFLAGS "-ldl"
+             -CFLAGS "-O2 -std=c++17 $(PIPELINE_CFLAGS)" -LDFLAGS "-ldl"
 
 # ARGS may be passed in by the difftest runner: ARGS="--diff=... --image=..."
 ARGS ?=

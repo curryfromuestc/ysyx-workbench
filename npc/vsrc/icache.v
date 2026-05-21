@@ -66,6 +66,7 @@ module icache #(
   // ---- 上游: CPU 取指 ------------------------------------------------------
   input              req_valid,
   input       [31:0] req_addr,
+  input              flush,
   output             resp_valid,
   output      [31:0] resp_data,
   // ---- 下游: SimpleBus master ---------------------------------------------
@@ -153,6 +154,7 @@ module icache #(
   localparam S_IDLE = 2'd0;
   localparam S_FILL = 2'd1;
   localparam S_DONE = 2'd2;
+  localparam S_DRAIN = 2'd3;
   reg [1:0] state, next_state;
 
   // fill_cnt: 本次 miss 已收到的 word 数. 范围 [0, BLOCK_WORDS-1].
@@ -172,9 +174,11 @@ module icache #(
   always @(*) begin
     next_state = state;
     case (state)
-      S_IDLE: if (req_valid & ~hit)         next_state = S_FILL;
-      S_FILL: if (fill_last)                next_state = S_DONE;
+      S_IDLE: if (req_valid & ~hit & ~flush) next_state = S_FILL;
+      S_FILL: if (flush)                    next_state = bus_resp_valid ? S_IDLE : S_DRAIN;
+              else if (fill_last)           next_state = S_DONE;
       S_DONE:                               next_state = S_IDLE;
+      S_DRAIN: if (bus_resp_valid)          next_state = S_IDLE;
       default:                              next_state = S_IDLE;
     endcase
   end
@@ -182,8 +186,8 @@ module icache #(
   // ---- 外部端口 ------------------------------------------------------------
   // idle_hit: S_IDLE + hit, 同周期组合返回.
   // done_resp: S_DONE 那一拍, 块已填好, 从 data_arr 按 miss_woff_r 取 word.
-  wire idle_hit  = (state == S_IDLE) & hit;
-  wire done_resp = (state == S_DONE);
+  wire idle_hit  = (state == S_IDLE) & hit & ~flush;
+  wire done_resp = (state == S_DONE) & ~flush;
 
   // 从命中块里按 word_off 选 word. 用一个跨 way / 跨 woff 的 mux.
   // 命中分支用 hit_way + req_woff; S_DONE 分支用 miss_way_r + miss_woff_r.
@@ -209,9 +213,11 @@ module icache #(
   assign resp_data  = done_resp ? done_word : hit_word;
 
   // S_FILL 期间持续拉 bus_req_valid, bus_req_addr = 当前 word 的字节地址.
+  // S_DRAIN 是 redirect/fault flush 后的排空态: 已发出的 IFU 读不能取消,
+  // 继续保持 req/address 稳定直到旧 resp 回来, 但丢弃该 resp.
   // 我们一拍一拍发, 每收到 resp_valid 就把 fill_cnt+1, 同时把 req_addr 推进 4B.
   // miss_base_r 在进入 S_FILL 的同一拍 latch 成块基地址.
-  assign bus_req_valid = (state == S_FILL);
+  assign bus_req_valid = (state == S_FILL) | (state == S_DRAIN);
   assign bus_req_addr  = miss_base_r + ({{(32-WCNT_W-2){1'b0}}, fill_cnt, 2'b00});
 
   // ---- 性能计数器 ----------------------------------------------------------
@@ -235,7 +241,7 @@ module icache #(
       end
       // 选 victim 计数: 在 fill 完成那一拍累加 (== S_FILL 最后一 beat).
       // 与 cnt_miss 同步, 保持 sanity check 不变量 victim == miss.
-      if ((state == S_FILL) & fill_last) cnt_victim <= cnt_victim + 64'h1;
+      if ((state == S_FILL) & fill_last & ~flush) cnt_victim <= cnt_victim + 64'h1;
     end
   end
 
@@ -270,7 +276,7 @@ module icache #(
       state <= next_state;
 
       // miss 入口: 在 S_IDLE 看到 miss 时锁存 set/tag/victim/word_off/base.
-      if ((state == S_IDLE) & req_valid & ~hit) begin
+      if ((state == S_IDLE) & req_valid & ~hit & ~flush) begin
         miss_index_r <= req_index;
         miss_tag_r   <= req_tag;
         miss_way_r   <= victim_way;
@@ -278,13 +284,14 @@ module icache #(
         // 块基地址: req_addr 的低 OFFSET_LOG 位清零.
         miss_base_r  <= {req_addr[31:OFFSET_LOG], {OFFSET_LOG{1'b0}}};
         fill_cnt     <= {WCNT_W{1'b0}};
+        valid_arr[req_index][victim_way] <= 1'b0;
       end
 
       // S_FILL 收到一拍 resp: 写入 data_arr 的对应 word slot, fill_cnt+1.
       // 最后一拍同时把 valid / tag 写好 (LRU 在 done_resp 那一拍更新).
       // 动态写 word slot: +: 起点不能是变量, 走 for 循环展开 case-on-fill_cnt.
       // BLOCK_WORDS=1 时退化为单次 iw=0 命中, 直接写低 32 位.
-      if ((state == S_FILL) & bus_resp_valid) begin
+      if ((state == S_FILL) & bus_resp_valid & ~flush) begin
         for (iw = 0; iw < BLOCK_WORDS; iw = iw + 1) begin
           if (iw[WCNT_W-1:0] == fill_cnt)
             data_arr[miss_index_r][miss_way_r][iw*32 +: 32] <= bus_resp_data;
