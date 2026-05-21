@@ -457,6 +457,14 @@ module CPU(
   wire        _cpu_io_lsu_wen;
   wire [31:0] _cpu_io_lsu_wdata;
   wire [3:0]  _cpu_io_lsu_wmask;
+  // B2a Access Fault: snoop AXI bresp / rresp on the master-out interface.
+  // Asserted in the cycle the slave returns SLVERR (2'b10) or DECERR (2'b11),
+  // i.e. when the b/r channel is in handshake (valid & ready). MemBridge
+  // itself ignores these bits; we forward the OR to the CPU so it can flush
+  // and restart at PC=0 per docs/2407/b/2.md.
+  wire _cpu_io_fault =
+    (auto_master_out_rvalid & auto_master_out_rready & (|auto_master_out_rresp)) |
+    (auto_master_out_bvalid & auto_master_out_bready & (|auto_master_out_bresp));
   ysyx_22040000 cpu (
     .clock            (clock),
     .reset            (reset),
@@ -471,7 +479,8 @@ module CPU(
     .io_lsu_size      (_cpu_io_lsu_size),
     .io_lsu_wen       (_cpu_io_lsu_wen),
     .io_lsu_wdata     (_cpu_io_lsu_wdata),
-    .io_lsu_wmask     (_cpu_io_lsu_wmask)
+    .io_lsu_wmask     (_cpu_io_lsu_wmask),
+    .io_fault         (_cpu_io_fault)
   );
   MemBridge bridge (
     .clock                   (clock),

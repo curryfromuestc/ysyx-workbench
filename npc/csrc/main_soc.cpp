@@ -132,8 +132,18 @@ int main(int argc, char **argv) {
   auto *r = top->rootp;
   bool trap_hit = false;
   int  trap_code = 0;
+  // B2a: keep tally of Access Fault events. ysyx_22040000.v raises any_fault
+  // (for one cycle) whenever AXI bresp/rresp != 2'b00 and the CPU
+  // simultaneously had an in-flight IFU/LSU request. Today no live ysyxSoC
+  // slave returns SLVERR/DECERR (every APB slave hard-ties pslverr=0), but
+  // tracking it here makes the metric available the moment a future
+  // microbench (B2c) or out-of-range probe trips one.
+  uint64_t fault_events = 0;
   while (!Verilated::gotFinish() && cycle_cnt < max_cycles) {
     clock_pulse();
+    if (r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__any_fault) {
+      ++fault_events;
+    }
     if (r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__state == 1 &&
         r->ysyxSoCFull__DOT__asic__DOT__cpu__DOT__cpu__DOT__inst_r == 0x00100073u) {
       trap_hit  = true;
@@ -160,6 +170,8 @@ int main(int argc, char **argv) {
             "for the prebuilt hello image this is the expected idle loop.\n",
             (unsigned long long)max_cycles);
   }
+  fprintf(stderr, "npc-soc: B2a access-fault events: %llu\n",
+          (unsigned long long)fault_events);
 
   delete top;
   return 0;

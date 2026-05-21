@@ -41,7 +41,16 @@ module ysyx_22040000(
   output [31:0] io_lsu_wdata,
   output [3:0]  io_lsu_wmask,
   input         io_lsu_respValid,
-  input  [31:0] io_lsu_rdata
+  input  [31:0] io_lsu_rdata,
+  // ---- B2a Access Fault -----------------------------------------------------
+  // Combinational pulse from the SoC bridge: high on the same cycle that
+  // io_ifu_respValid / io_lsu_respValid is high IF the underlying AXI bresp /
+  // rresp != 2'b00 (SLVERR or DECERR). When asserted the CPU treats the
+  // current transaction as failed: flushes any partial decode/regfile/CSR
+  // write that this instruction would have caused and forces the next fetch
+  // PC to 0. Wired to 0 by the DPI-C harness top so non-SoC builds are
+  // unaffected.
+  input         io_fault
 );
   // ---- FSM ------------------------------------------------------------------
   localparam S_IF = 2'd0;
@@ -254,17 +263,42 @@ module ysyx_22040000(
   assign io_lsu_wdata    = store_word;
   assign io_lsu_wmask    = store_wmask;
 
+  // ---- B2a Access Fault decoding -------------------------------------------
+  // io_fault is the combinational SLVERR/DECERR pulse from the SoC bridge.
+  // It is valid only on a cycle when the corresponding respValid is also
+  // high; we further gate by the current FSM state so that a stale fault
+  // signal in some other state (which the bridge does not produce today
+  // anyway) can never poison an instruction it shouldn't.
+  wire ifu_fault = (state == S_IF) & io_ifu_respValid & io_fault;
+  wire lsu_fault = (state == S_LS) & io_lsu_respValid & io_fault;
+  wire any_fault = ifu_fault | lsu_fault;
+
+  // Sticky fault counter for observability from the harness: incremented
+  // every cycle that any_fault is asserted. Useful for B2b/microbench when
+  // SDRAM-decoded SLVERR will start showing up; the C harness can poke
+  // this via verilator's __DOT__ accessor.
+  reg [31:0] fault_count;
+  always @(posedge clock) begin
+    if (reset)              fault_count <= 32'h0;
+    else if (any_fault)     fault_count <= fault_count + 32'h1;
+  end
+
   // ---- FSM next-state -------------------------------------------------------
   always @(*) begin
     next_state = state;
     case (state)
-      S_IF: if (io_ifu_respValid) next_state = S_EX;
+      // On IFU fault: skip decode entirely and restart fetch (PC <= 0).
+      S_IF: if (ifu_fault)               next_state = S_IF;
+            else if (io_ifu_respValid)   next_state = S_EX;
       S_EX: begin
         if (is_ebreak)                 next_state = S_EX; // park forever on ebreak
         else if (mem_re | mem_we)      next_state = S_LS;
         else                           next_state = S_WB;
       end
-      S_LS: if (io_lsu_respValid)      next_state = S_WB;
+      // On LSU fault: skip writeback (don't commit reg/CSR with junk rdata),
+      // restart fetch (PC <= 0).
+      S_LS: if (lsu_fault)               next_state = S_IF;
+            else if (io_lsu_respValid)   next_state = S_WB;
       S_WB:                            next_state = S_IF;
       default:                         next_state = S_IF;
     endcase
@@ -279,13 +313,26 @@ module ysyx_22040000(
       lsu_rdata_r <= 32'h0;
     end else begin
       state <= next_state;
-      if (state == S_IF && io_ifu_respValid) begin
+      // Latch the IFU result only on a clean fetch; on fault, leave inst_r
+      // alone so we never decode the (likely zero) rdata that came with the
+      // SLVERR response.
+      if (state == S_IF && io_ifu_respValid && !ifu_fault) begin
         inst_r <= io_ifu_rdata;
       end
-      if (state == S_LS && io_lsu_respValid && mem_re) begin
+      // Same idea on the load side: a fault response brings back junk
+      // rdata; don't latch it, so even if some downstream consumer peeks
+      // lsu_rdata_r it sees the previous (last good) value.
+      if (state == S_LS && io_lsu_respValid && mem_re && !lsu_fault) begin
         lsu_rdata_r <= io_lsu_rdata;
       end
-      if (state == S_WB && !is_ebreak) begin
+      // PC update rules:
+      //   1. Any access fault on this instruction -> next PC = 0
+      //      (docs/2407/b/2.md: "let NPC jump to address 0 when AXI resp
+      //      reports an error, even before CTE is enabled").
+      //   2. Otherwise the normal WBU-decided pc_next at S_WB commit.
+      if (any_fault) begin
+        pc <= 32'h0;
+      end else if (state == S_WB && !is_ebreak) begin
         pc <= pc_next;
       end
     end
