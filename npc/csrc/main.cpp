@@ -14,6 +14,7 @@
 #include <sys/time.h>
 #include <verilated.h>
 #include "Vcpu.h"
+#include "Vcpu___024root.h"
 
 #define PMEM_BASE   0x80000000u
 #define PMEM_SIZE   (128u * 1024u * 1024u)
@@ -175,13 +176,84 @@ static size_t load_image(const char *path) {
   return rd;
 }
 
-// --- difftest stub -----------------------------------------------------------
-// run-difftest.sh wraps `make sim ARGS="--diff=<so> --image=<bin>"`. Loading
-// the .so is sufficient to exercise the wiring; we do not yet step-compare. As
-// long as we do NOT print "DIFFTEST: failed" and we DO print "HIT GOOD TRAP",
-// the wrapper script reports passed.
-static void *diff_handle = nullptr;
-static void diff_init(const char *so) {
+// --- difftest ----------------------------------------------------------------
+// C2b: dlopen the NEMU REF .so (built from
+// nemu/configs/riscv32-nemu-share_defconfig), then on every retired
+// instruction step REF by one and compare PC + 16 GPRs against the NPC RTL.
+//
+// NPC is a single-cycle CPU: each posedge clk retires exactly one instruction
+// (unless `rst` is asserted or the trap signal has fired). The trap fires
+// asynchronously from the DPI npc_trap() call on ebreak; the cycle that
+// retires the ebreak should NOT step REF (REF would do an additional ebreak
+// instead of stopping).
+//
+// CPU_state-shaped buffer we hand to ref_difftest_regcpy. Layout MUST match
+// nemu/src/isa/riscv32/include/isa-def.h::riscv32_CPU_state when REF is built
+// with CONFIG_RVE=y (which our riscv32-nemu-share_defconfig guarantees):
+//   uint32_t gpr[16];
+//   uint32_t pc;
+//   uint32_t mstatus, mtvec, mepc, mcause;   // CSR tail
+// Total = (16 + 1 + 4) * 4 = 84 bytes.
+struct NpcRegState {
+  uint32_t gpr[16];
+  uint32_t pc;
+  uint32_t mstatus;
+  uint32_t mtvec;
+  uint32_t mepc;
+  uint32_t mcause;
+};
+
+typedef void (*ref_memcpy_fn)(uint32_t addr, void *buf, size_t n, bool dir);
+typedef void (*ref_regcpy_fn)(void *buf, bool dir);
+typedef void (*ref_exec_fn)(uint64_t n);
+typedef void (*ref_init_fn)(int port);
+
+static void           *diff_handle = nullptr;
+static bool            diff_enabled = false;
+static ref_memcpy_fn   ref_memcpy = nullptr;
+static ref_regcpy_fn   ref_regcpy = nullptr;
+static ref_exec_fn     ref_exec   = nullptr;
+static ref_init_fn     ref_init   = nullptr;
+static uint64_t        diff_mismatch_cycle = 0;
+// Latched at clk=0 phase, consumed after clk=1 phase. Records whether the
+// instruction that is ABOUT TO retire touches an MMIO address. We sample
+// pre-edge because right after the posedge the combinational LSU signals
+// have already swung to the NEXT (post-PC-update) instruction.
+static bool            diff_was_mmio_this_cycle = false;
+
+enum { DIFF_TO_DUT = 0, DIFF_TO_REF = 1 };
+
+// Pull RTL state straight out of the Verilator-generated root. Path names
+// here mirror what verilator emits for `cpu.u_rf.rf` etc. — they will drift
+// if the RTL module hierarchy changes, in which case grep them out of
+// build/obj_dir/Vcpu___024root.h again.
+static inline uint32_t rtl_pc()                  { return top->rootp->cpu__DOT__pc; }
+static inline uint32_t rtl_gpr(int i)            { return top->rootp->cpu__DOT__u_rf__DOT__rf[i]; }
+static inline uint32_t rtl_lsu_addr()            { return top->rootp->cpu__DOT__u_exu__DOT__alu_result; }
+static inline bool     rtl_lsu_active() {
+  return top->rootp->cpu__DOT____Vcellinp__u_lsu__mem_re
+      || top->rootp->cpu__DOT____Vcellinp__u_lsu__mem_we;
+}
+
+static void snapshot_dut(NpcRegState *s) {
+  for (int i = 0; i < 16; ++i) s->gpr[i] = rtl_gpr(i);
+  s->pc      = rtl_pc();
+  s->mstatus = 0;            // CSR not modelled in NPC RV32E for now
+  s->mtvec   = 0;
+  s->mepc    = 0;
+  s->mcause  = 0;
+}
+
+// Side-effect-free MMIO predicate. The LSU's raw alu_result is a byte
+// address — strip the low 2 bits so we hit the same word-granular MMIO
+// regions the pmem_read/pmem_write hooks recognise.
+static inline bool addr_is_mmio(uint32_t a) {
+  uint32_t wa = a & ~3u;
+  return wa == UART_BASE_W0 || wa == UART_BASE_W1
+      || wa == RTC_ADDR_LO  || wa == RTC_ADDR_HI;
+}
+
+static void diff_init_so(const char *so) {
   if (!so || !*so) return;
   diff_handle = dlopen(so, RTLD_LAZY | RTLD_LOCAL);
   if (!diff_handle) {
@@ -189,13 +261,104 @@ static void diff_init(const char *so) {
             so, dlerror());
     return;
   }
-  fprintf(stderr, "npc: difftest reference loaded: %s\n", so);
+  ref_memcpy = (ref_memcpy_fn) dlsym(diff_handle, "difftest_memcpy");
+  ref_regcpy = (ref_regcpy_fn) dlsym(diff_handle, "difftest_regcpy");
+  ref_exec   = (ref_exec_fn)   dlsym(diff_handle, "difftest_exec");
+  ref_init   = (ref_init_fn)   dlsym(diff_handle, "difftest_init");
+  if (!ref_memcpy || !ref_regcpy || !ref_exec || !ref_init) {
+    fprintf(stderr, "npc: warning: difftest .so missing required symbols\n");
+    dlclose(diff_handle);
+    diff_handle = nullptr;
+    return;
+  }
+  ref_init(0);
+  diff_enabled = true;
+  fprintf(stderr, "npc: difftest enabled (REF=%s)\n", so);
+}
+
+// Ship the program image into REF and align REF's CPU state with NPC's
+// reset state. Called once after RTL reset has been released.
+static void diff_sync_from_dut(size_t img_size) {
+  if (!diff_enabled) return;
+  // Reset state of NPC: gpr=0, pc=0x80000000 (matches NEMU init_isa).
+  // Copy the loaded program over to REF so its first cpu_exec(1) fetches the
+  // same bytes NPC's IFU does.
+  if (img_size > 0) {
+    ref_memcpy(PMEM_BASE, pmem, img_size, DIFF_TO_REF);
+  }
+  NpcRegState st;
+  snapshot_dut(&st);
+  ref_regcpy(&st, DIFF_TO_REF);
+}
+
+// Compare REF and DUT after one retired instruction. If they diverge, print
+// a verbose diff and arrange a clean shutdown via trap_hit (so main() prints
+// "DIFFTEST: failed" and the wrapper script picks it up).
+static void diff_step_and_check() {
+  if (!diff_enabled) return;
+
+  // Skip MMIO instructions: REF's MMIO model (none, because DEVICE=n in
+  // share_defconfig) would diverge from NPC's UART/RTC. Copy DUT->REF and
+  // do NOT advance REF for this instruction. The semantic is identical to
+  // NEMU's difftest_skip_ref() — see nemu/src/cpu/difftest/dut.c.
+  // We must read the LSU signals BEFORE clocking again, so this function is
+  // called immediately after the clk=1 eval of the retiring instruction.
+  // At that point the combinational LSU signals reflect the NEXT instr (PC
+  // already advanced), so we cache the predicate state pre-edge.
+  bool was_mmio = diff_was_mmio_this_cycle;
+  diff_was_mmio_this_cycle = false;
+
+  if (was_mmio) {
+    NpcRegState st;
+    snapshot_dut(&st);
+    ref_regcpy(&st, DIFF_TO_REF);
+    return;
+  }
+
+  ref_exec(1);
+
+  NpcRegState ref_st;
+  ref_regcpy(&ref_st, DIFF_TO_DUT);
+
+  bool bad = false;
+  uint32_t dut_pc = rtl_pc();
+  if (ref_st.pc != dut_pc) {
+    fprintf(stderr, "DIFFTEST: pc mismatch @cycle %llu: ref=0x%08x dut=0x%08x\n",
+            (unsigned long long)cycle_cnt, ref_st.pc, dut_pc);
+    bad = true;
+  }
+  for (int i = 0; i < 16; ++i) {
+    uint32_t r = ref_st.gpr[i];
+    uint32_t d = rtl_gpr(i);
+    if (r != d) {
+      fprintf(stderr, "DIFFTEST: x%-2d mismatch @cycle %llu: ref=0x%08x dut=0x%08x\n",
+              i, (unsigned long long)cycle_cnt, r, d);
+      bad = true;
+    }
+  }
+  if (bad) {
+    diff_mismatch_cycle = cycle_cnt;
+    fprintf(stderr, "DIFFTEST: failed (first mismatch at cycle %llu, dut pc=0x%08x)\n",
+            (unsigned long long)diff_mismatch_cycle, dut_pc);
+    // Force loop exit. We reuse trap_hit so the "DIFFTEST: failed" print at
+    // the end of main() also lands.
+    trap_hit  = true;
+    trap_code = -2;
+  }
 }
 
 // --- main loop ---------------------------------------------------------------
+// Drive one clock cycle. When difftest is enabled we sample the LSU's MMIO
+// predicate at clk=0 phase (after combinational has settled, before the
+// register update), then trigger the posedge. The caller is responsible for
+// invoking diff_step_and_check() after this returns, unless `rst` is high.
 static void clock_pulse() {
   top->clk = 0;
   top->eval();
+  if (diff_enabled && !top->rst) {
+    uint32_t a = rtl_lsu_addr();
+    diff_was_mmio_this_cycle = rtl_lsu_active() && addr_is_mmio(a);
+  }
   top->clk = 1;
   top->eval();
   cycle_cnt++;
@@ -218,30 +381,42 @@ int main(int argc, char **argv) {
   pmem = (uint8_t *)calloc(PMEM_SIZE, 1);
   if (!pmem) { fprintf(stderr, "npc: pmem alloc failed\n"); return 2; }
 
+  size_t image_size = 0;
   if (image_path) {
-    size_t n = load_image(image_path);
-    if (!n) { free(pmem); return 2; }
-    fprintf(stderr, "npc: loaded %zu bytes from %s\n", n, image_path);
+    image_size = load_image(image_path);
+    if (!image_size) { free(pmem); return 2; }
+    fprintf(stderr, "npc: loaded %zu bytes from %s\n", image_size, image_path);
   } else {
     fprintf(stderr, "npc: no image provided (--image=...); running empty memory\n");
   }
 
-  diff_init(diff_so);
+  diff_init_so(diff_so);
 
   top = new Vcpu;
 
-  // reset for 5 cycles
+  // reset for 5 cycles. We hold diff disabled-ish (clock_pulse() skips its
+  // pre-edge MMIO sample while rst==1), then sync REF to DUT's reset state.
   top->rst = 1;
   for (int i = 0; i < 5; ++i) clock_pulse();
   top->rst = 0;
+  // After reset is released we still need one combinational settle to expose
+  // the post-reset register values before we snapshot them for REF.
+  top->eval();
+  diff_sync_from_dut(image_size);
 
   while (!Verilated::gotFinish() && !trap_hit && cycle_cnt < max_cycles) {
     clock_pulse();
+    diff_step_and_check();
   }
 
   int rc;
   if (trap_hit) {
-    if (trap_code == 0) {
+    if (trap_code == -2) {
+      // diff_step_and_check already printed the per-reg diff lines above.
+      printf("DIFFTEST: failed (mismatch at cycle %llu)\n",
+             (unsigned long long)diff_mismatch_cycle);
+      rc = 1;
+    } else if (trap_code == 0) {
       printf("HIT GOOD TRAP\n");
       rc = 0;
     } else {
