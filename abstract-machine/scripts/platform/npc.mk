@@ -9,6 +9,13 @@ AM_SRCS := riscv/npc/start.S \
            platform/dummy/mpe.c
 
 CFLAGS    += -fdata-sections -ffunction-sections
+
+# Host riscv64-linux-gnu cross toolchain is built for lp64d and ships only
+# stubs-lp64d.h; rv32e_ilp32e compilation pulls in <gnu/stubs-ilp32.h> via
+# klib's <limits.h>. Provide empty stub headers shipped alongside NPC tools.
+NPC_HOME ?= $(abspath $(AM_HOME)/../npc)
+CFLAGS    += -isystem $(NPC_HOME)/tools/sysinc
+ASFLAGS   += -isystem $(NPC_HOME)/tools/sysinc
 LDSCRIPTS += $(AM_HOME)/scripts/linker.ld
 LDFLAGS   += --defsym=_pmem_start=0x80000000 --defsym=_entry_offset=0x0
 LDFLAGS   += --gc-sections -e _start
@@ -26,6 +33,6 @@ image: image-dep
 	@$(OBJCOPY) -S --set-section-flags .bss=alloc,contents -O binary $(IMAGE).elf $(IMAGE).bin
 
 run: insert-arg
-	echo "TODO: add command here to run simulation"
+	@$(MAKE) -s -C $(NPC_HOME) sim ARGS="--image=$(IMAGE).bin"
 
 .PHONY: insert-arg

@@ -15,6 +15,9 @@ void putch(char ch) {
 }
 
 void halt(int code) {
+  // Pass exit code via a0, then ebreak so the NPC simulator stops with
+  // HIT GOOD / BAD TRAP.
+  asm volatile("mv a0, %0; ebreak" : : "r"(code));
   while (1);
 }
 
