@@ -66,12 +66,23 @@ int _open(const char *path, int flags, mode_t mode) {
 }
 
 int _write(int fd, void *buf, size_t count) {
-  _exit(SYS_write);
-  return 0;
+  return _syscall_(SYS_write, fd, (intptr_t)buf, count);
 }
 
+// _sbrk tracks program-break itself; we only ask the kernel to (eventually)
+// honor a target via SYS_brk. The first malloc() calls _sbrk(0) to learn the
+// initial break, which by ld convention is &_end.
+extern char _end;
 void *_sbrk(intptr_t increment) {
-  return (void *)-1;
+  static char *program_break = NULL;
+  if (program_break == NULL) program_break = &_end;
+  char *old_break = program_break;
+  char *new_break = old_break + increment;
+  if (_syscall_(SYS_brk, (intptr_t)new_break, 0, 0) != 0) {
+    return (void *)-1;
+  }
+  program_break = new_break;
+  return old_break;
 }
 
 int _read(int fd, void *buf, size_t count) {

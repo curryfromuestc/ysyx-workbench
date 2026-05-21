@@ -7,9 +7,16 @@ static Context* (*user_handler)(Event, Context*) = NULL;
 Context* __am_irq_handle(Context *c) {
   if (user_handler) {
     Event ev = {0};
+    // NEMU stores the ecall's a7 into mcause (see riscv32/inst.c). yield()
+    // sets a7 = -1 to mark a YIELD; any other value is a real syscall number.
     switch (c->mcause) {
-      default: ev.event = EVENT_ERROR; break;
+      case (uintptr_t)-1: ev.event = EVENT_YIELD; break;
+      default:            ev.event = EVENT_SYSCALL; break;
     }
+
+    // ecall saves the PC of the ecall instruction itself into mepc; advance
+    // past it so mret returns to the next instruction.
+    c->mepc += 4;
 
     c = user_handler(ev, c);
     assert(c != NULL);
