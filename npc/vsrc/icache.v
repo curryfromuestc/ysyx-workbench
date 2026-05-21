@@ -139,9 +139,4 @@ module icache #(
     end
   end
 
-  // ---- verilator 防止误报未用 ----------------------------------------------
-  // (cnt_access 等仅供 C 侧 DPI 读取, RTL 内部无 sink)
-  // verilator lint_off UNUSED
-  wire _unused_cnt = &{1'b0, cnt_access, cnt_hit, cnt_miss};
-  // verilator lint_on UNUSED
 endmodule
