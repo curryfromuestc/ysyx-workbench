@@ -10,6 +10,20 @@ void __am_input_keybrd(AM_INPUT_KEYBRD_T *);
 static void __am_timer_config(AM_TIMER_CONFIG_T *cfg) { cfg->present = true; cfg->has_rtc = true; }
 static void __am_input_config(AM_INPUT_CONFIG_T *cfg) { cfg->present = true;  }
 static void __am_uart_config(AM_INPUT_CONFIG_T *cfg) { cfg->present = false;  }
+// No display/audio/disk/net device on NPC yet. Stubs let optional-feature
+// gates (e.g. typing-game's video_init iterating a 0x0 framebuffer) become
+// harmless no-ops instead of panicking through the fail() fallback.
+static void __am_gpu_config(AM_GPU_CONFIG_T *cfg) {
+  cfg->present = false; cfg->has_accel = false;
+  cfg->width = 0; cfg->height = 0; cfg->vmemsz = 0;
+}
+static void __am_gpu_status(AM_GPU_STATUS_T *st) { st->ready = true; }
+static void __am_audio_config(AM_AUDIO_CONFIG_T *cfg) { cfg->present = false; cfg->bufsize = 0; }
+static void __am_audio_status(AM_AUDIO_STATUS_T *st) { st->count = 0; }
+static void __am_disk_config(AM_DISK_CONFIG_T *cfg) { cfg->present = false; cfg->blksz = 0; cfg->blkcnt = 0; }
+static void __am_disk_status(AM_DISK_STATUS_T *st) { st->ready = true; }
+static void __am_net_config(AM_NET_CONFIG_T *cfg) { cfg->present = false; }
+static void __am_noop(void *buf) { (void)buf; }
 
 typedef void (*handler_t)(void *buf);
 static void *lut[128] = {
@@ -18,7 +32,20 @@ static void *lut[128] = {
   [AM_TIMER_UPTIME] = __am_timer_uptime,
   [AM_INPUT_CONFIG] = __am_input_config,
   [AM_INPUT_KEYBRD] = __am_input_keybrd,
-  [AM_UART_CONFIG]  = __am_uart_config,
+  [AM_UART_CONFIG ] = __am_uart_config,
+  [AM_GPU_CONFIG  ] = __am_gpu_config,
+  [AM_GPU_STATUS  ] = __am_gpu_status,
+  [AM_GPU_FBDRAW  ] = __am_noop,
+  [AM_GPU_MEMCPY  ] = __am_noop,
+  [AM_GPU_RENDER  ] = __am_noop,
+  [AM_AUDIO_CONFIG] = __am_audio_config,
+  [AM_AUDIO_CTRL  ] = __am_noop,
+  [AM_AUDIO_STATUS] = __am_audio_status,
+  [AM_AUDIO_PLAY  ] = __am_noop,
+  [AM_DISK_CONFIG ] = __am_disk_config,
+  [AM_DISK_STATUS ] = __am_disk_status,
+  [AM_DISK_BLKIO  ] = __am_noop,
+  [AM_NET_CONFIG  ] = __am_net_config,
 };
 
 static void fail(void *buf) { panic("access nonexist register"); }

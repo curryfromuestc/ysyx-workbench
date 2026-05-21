@@ -9,6 +9,7 @@ AM_SRCS := riscv/npc/start.S \
            platform/dummy/mpe.c
 
 CFLAGS    += -fdata-sections -ffunction-sections
+CFLAGS    += -I$(AM_HOME)/am/src/platform/npc/include
 
 # Host riscv64-linux-gnu cross toolchain is built for lp64d and ships only
 # stubs-lp64d.h; rv32e_ilp32e compilation pulls in <gnu/stubs-ilp32.h> via

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <sys/time.h>
 #include <verilated.h>
 #include "Vcpu.h"
 
@@ -18,11 +19,16 @@
 #define PMEM_SIZE   (128u * 1024u * 1024u)
 #define PMEM_END    (PMEM_BASE + PMEM_SIZE)
 
+// MMIO devices (NPC side; kept in sync with am/src/platform/npc/include/npc.h)
+#define SERIAL_PORT_ADDR  0x10000000u
+#define RTC_ADDR_LO       0xa0000048u
+#define RTC_ADDR_HI       0xa000004cu
+
 static uint8_t  *pmem  = nullptr;
 static Vcpu     *top   = nullptr;
 static bool      trap_hit   = false;
 static int       trap_code  = -1;
-static uint64_t  max_cycles = 10000000ull;
+static uint64_t  max_cycles = 1000000000ull;
 static uint64_t  cycle_cnt  = 0;
 
 // --- pmem helpers ------------------------------------------------------------
@@ -34,8 +40,56 @@ static inline uint8_t *guest_to_host(uint32_t addr) {
   return pmem + (addr - PMEM_BASE);
 }
 
+// --- MMIO devices ------------------------------------------------------------
+// Uptime in microseconds since the first call. Matches NEMU's get_time().
+static uint64_t boot_us = 0;
+static uint64_t now_us() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (uint64_t)tv.tv_sec * 1000000ull + (uint64_t)tv.tv_usec;
+}
+static uint64_t get_uptime_us() {
+  uint64_t t = now_us();
+  if (boot_us == 0) boot_us = t;
+  return t - boot_us;
+}
+
+// Latched RTC: AM reads HI first to refresh, then LO. We snapshot on a HI read.
+static uint32_t rtc_lo_latched = 0;
+static uint32_t rtc_hi_latched = 0;
+
+static uint32_t mmio_read(uint32_t addr) {
+  if (addr == RTC_ADDR_HI) {
+    uint64_t us = get_uptime_us();
+    rtc_lo_latched = (uint32_t)us;
+    rtc_hi_latched = (uint32_t)(us >> 32);
+    return rtc_hi_latched;
+  }
+  if (addr == RTC_ADDR_LO) return rtc_lo_latched;
+  return 0;
+}
+
+static void mmio_write(uint32_t addr, uint32_t data, uint8_t mask) {
+  // Verilator re-evaluates combinational LSU multiple times across one CPU
+  // cycle (clk=0 phase + post-posedge clk=1 phase). Picking a single phase
+  // makes each store fire the MMIO side effect exactly once.
+  if (top == nullptr || top->clk != 0) return;
+
+  if (addr == SERIAL_PORT_ADDR && (mask & 0x1)) {
+    putchar((char)(data & 0xff));
+    fflush(stdout);
+  }
+}
+
+static inline bool in_mmio(uint32_t addr) {
+  return addr == SERIAL_PORT_ADDR
+      || addr == RTC_ADDR_LO
+      || addr == RTC_ADDR_HI;
+}
+
 extern "C" int pmem_read(int raddr) {
   uint32_t a = ((uint32_t)raddr) & ~3u;
+  if (in_mmio(a)) return (int)mmio_read(a);
   if (!in_pmem(a)) {
     // Out-of-range reads are common during reset / before .bin is loaded;
     // return 0 instead of crashing.
@@ -48,10 +102,11 @@ extern "C" int pmem_read(int raddr) {
 
 extern "C" void pmem_write(int waddr, int wdata, char wmask) {
   uint32_t a = ((uint32_t)waddr) & ~3u;
-  if (!in_pmem(a)) return;
-  uint8_t *p = guest_to_host(a);
   uint8_t  m = (uint8_t)wmask;
   uint32_t d = (uint32_t)wdata;
+  if (in_mmio(a)) { mmio_write(a, d, m); return; }
+  if (!in_pmem(a)) return;
+  uint8_t *p = guest_to_host(a);
   for (int i = 0; i < 4; ++i) {
     if (m & (1u << i)) p[i] = (uint8_t)((d >> (8 * i)) & 0xff);
   }
